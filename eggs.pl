@@ -1832,7 +1832,9 @@ sub doeggwidget {
   #if ($$w{redraw} or $bg) {
   blankrect($s, $$w{x}, $$w{y}, $$w{xmax} - 1, $$w{ymax} - 1,
             #($bg eq "__TRANSPARENT__" ? $bg : clr($bg, "bg"))
-            widgetbg($w), " ", widgetfg($w));
+            sub { my ($x,$y) = @_;
+                  return widgetbg($w, undef, $$s[$x][$y]);
+                }, " ", widgetfg($w));
   doborder($w, $s);
   #}
   my $n = 0;
