@@ -3,10 +3,13 @@
 
 use Term::Size;
 use Carp;
+use utf8;
 
 our %option;
 our @namedcolor = named_colors();
 our %namedcolor = map { $$_{name} => $_ } @namedcolor;
+our %magictext;
+our ($widgetlogfile, $colorlogfile, $screenlogfile);
 # TODO: consider whether we need access to %state
 # TODO: standardize color handling between monitor.pl, eggs.pl, tsvdb.pl, and utm.pl
 
@@ -546,9 +549,6 @@ sub doborder {
 
 sub dotext {
   my ($t, $s) = @_;
-  my ($ut, $users) = uptime();
-  my %magictext = ( __UPTIME__ => $ut,
-                    __USERS__  => $users . " users", );
   if (not $$t{__DONE__}) {
     my $text = (defined $$t{text}) ? $$t{text} : $$t{title} || $$t{type} || "t_$$t{id}";
     $text = $magictext{$text} || $text;
@@ -707,17 +707,30 @@ sub widgetbg {
 
 sub drawscreen {
   my ($s, %arg) = @_;
+  if ($arg{debug}) {
+    overwritelogfile($screenlogfile,
+                     Dumper(+{ __screen__ => $s,
+                               __arg__    => \%arg,
+                               __named__  => \%namedcolor,
+                             }));
+  }
   my $depth = $arg{colordepth} || 8;
   if ($arg{nohome}) {
     print $reset . "\n\n";
   } else {
     print chr(27) . "[H" . $reset;
   }
+  if ((not $arg{xmax}) or (not $arg{ymax})) {
+    ($arg{xmax}, $arg{ymax}) = Term::Size::chars *STDOUT{IO};
+    $arg{xmax} ||= 80;
+    $arg{ymax} ||= 24;
+    $arg{xmax}--; $arg{ymax}--; # Term::Size::chars returns counts, not zero-indexed maxima.
+  }
   for my $y (0 .. $arg{ymax}) {
     my $lastbg = "";
     my $lastfg = "";
     for my $x (0 .. $arg{xmax}) {
-      my $nbg = $namedcolor{$$s[$x][$y]{bg}} || $namedcolor{bg} || $namedcolor{slate};
+      my $nbg = $namedcolor{$$s[$x][$y]{bg}} || $namedcolor{bg} || $namedcolor{slate} || $namedcolor{black};
       my $bgcode = (("ARRAY" eq ref $$s[$x][$y]{bg})
                     ? rgb(@{$$s[$x][$y]{bg}}, "bg")
                     : colorcode($nbg, $depth, "bg") || "");
@@ -725,16 +738,29 @@ sub drawscreen {
       my $fgcode = (("ARRAY" eq ref $$s[$x][$y]{fg})
                     ? rgb(@{$$s[$x][$y]{fg}})
                     : colorcode($nfg, $depth) || "");
+      my $char   = (length($$s[$x][$y]{char}) ? $$s[$x][$y]{char} : " ");
+      drawscreenlog(Dumper(+{ nbg    => $nbg,
+                              bgcode => $bgcode,
+                              nfg    => $nfg,
+                              fgcode => $fgcode,
+                              cell   => $$s[$x][$y],
+                              char   => $char,
+                              x      => $x,
+                              xmax   => $arg{xmax},
+                              y      => $y,
+                              ymax   => $arg{ymax},
+                              fr     => $arg{fullrect},
+                            }));
       print "" . (($$s[$x][$y]{bg} eq $lastbg) ? "" : $bgcode)
                . (($$s[$x][$y]{fg} eq $lastfg) ? "" : $fgcode)
-               . (length($$s[$x][$y]{char}) ? $$s[$x][$y]{char} : " ")
+               . $char
         unless (($x == $arg{xmax}) and
                 ($y == $arg{ymax}) and
                 (not $arg{fullrect}));
       $lastbg = $$s[$x][$y]{bg};
       $lastfg = $$s[$x][$y]{fg};
     }
-    print $reset . "\n" unless $y == $arg{ymax};
+    print $reset . "\n" unless (($y >= $arg{ymax}) || (not $y));
   }
 }
 
@@ -1166,3 +1192,10 @@ sub named_colors {
                                  b => 188, }}},
          );
 }
+
+sub gotoxy {
+  my ($x, $y) = @_;
+  return "\033[${y};${x}H";
+}
+
+42;

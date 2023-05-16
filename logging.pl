@@ -9,7 +9,9 @@ our $timezone; require "./timezone.pl";
 $timezone ||= "UTC";
 
 our ($datadir, $logdir,
-     $widgetlogfile, $colorlogfile, $monitorlogfile, $verboselogfile, $egggamelogfile,
+     $widgetlogfile, $colorlogfile, $screenlogfile,
+     $monitorlogfile, $verboselogfile,
+     $egggamelogfile,
     );
 require "./paths.pl";
 
@@ -35,6 +37,19 @@ sub sendtologfile {
   sendtologfiles($info, $logfile);
 }
 
+sub overwritelogfile {
+  my ($lf, $info) = @_;
+  # Use for logfiles where you only want the most recent output.
+  my $now = DateTime->now(time_zone => $timezone);
+  open LOG, ">", $lf
+    or die "Cannot append to $lf: $!";
+  print LOG "" . $now->day_abbr() . " " . $now->month_abbr()
+    . " " . sprintf("%02d", $now->mday()) . " "
+    . sprintf("%02d%02d", $now->hour(), $now->minute()) . "." . sprintf("%02d", $now->second()) . " "
+    . $info . "\n";
+  close LOG;
+}
+
 sub verboselog {
   my ($info) = @_;
   my $now = DateTime::HiRes->now(time_zone => $timezone);
@@ -52,6 +67,10 @@ sub widgetlog {
 sub colorlog {
   my ($info) = @_;
   sendtologfile($colorlogfile, $info);
+}
+sub drawscreenlog {
+  my ($info) = @_;
+  sendtologfile($screenlogfile, $info);
 }
 
 sub monitorlog {

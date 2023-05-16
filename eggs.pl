@@ -15,7 +15,13 @@ use File::HomeDir;
 use Math::Tau;
 use Carp;
 
+our (%option, $egggamelogfile, $widgetlogfile, $colorlogfile);
+require "./paths.pl";
+require "./logging.pl";
+require "./widgets.pl";
+
 my $version = "0.2 alpha";
+binmode(STDOUT, ":utf8");
 
 #################################################################################################
 #################################################################################################
@@ -25,7 +31,7 @@ my $version = "0.2 alpha";
 #################################################################################################
 #################################################################################################
 
-my @clrdef = colordefs(); # Needed here because certain options base their enums on it.
+my @clrdef = named_colors(); # Needed here because certain options base their enums on it.
 my @clropt = map {  +{ key => $$_{key}, value => $$_{name}, name => $$_{name}, },
                   } grep { $$_{key} } @clrdef;
 my @option = ( +{ short    => "-",
@@ -215,6 +221,7 @@ my @option = ( +{ short    => "-",
              );
 my %opt = map { $$_{name} => $$_{default} } @option;
 loadoptions(\%opt);
+%option = %opt; # for widgets.pl use
 
 my @cmda = @ARGV; while (scalar @cmda) {
   my $x = shift @cmda;
@@ -285,6 +292,14 @@ my @relative = (["favourite uncle",  "he",  "his"],
                 ["pastor",           "he",  "his"],
                );
 #use Data::Dumper; print Dumper(+{ relative => \@relative }); exit 0;
+
+for my $lf ($widgetlogfile, $colorlogfile, $egggamelogfile) {
+  my $msg = qq[*************** Starting Egg Game $version ($0) [$$] ***************];
+  if ($opt{clearlogs}) {
+    overwritelogfile($lf, $msg);
+  } else {
+    sendtologfile($lf, $msg);
+  }}
 
 my %cashflow;
 my %globalkeybinding = global_key_bindings();
@@ -736,7 +751,7 @@ while (1) {
     $$w{__INTERVAL_POS__} = $$w{__INTERVAL_POS__} - 1 if $$w{interval};
   }
   updatetopbar($wtopbar);
-  drawscreen($screen);
+  draweggscreen($screen);
   my $delay = $opt{delay} || 1;
   while ($delay > 0) {
     my $since = [gettimeofday()];
@@ -1787,29 +1802,7 @@ sub input_ordkey {
     }
     $n--;
   }
-  drawscreen($screen);
-}
-
-sub setfocus {
-  my ($widget) = @_;
-  $$wfocus{bg} = undef;
-  $wfocus = $widget;
-  $$wfocus{bg} = $opt{focusbgcolor};
-}
-
-sub rotate_focus { # The user is tabbing from pane to pane.
-  my $fid = (ref $wfocus) ? $$wfocus{id} : 0;
-  $fid++;
-  if ($fid > $wcount) { $fid = 0; }
-  while (not grep { $$_{id} eq $fid } @widget) {
-    $fid++;
-    if ($fid > $wcount) { $fid = 0; }
-  }
-  setfocus(grep { $$_{id} eq $fid } @widget);
-  if ($$wfocus{skipfocus}) {
-    # Do not, I repeat, do NOT make all widgets skipfocus.
-    rotate_focus();
-  }
+  draweggscreen($screen);
 }
 
 #################################################################################################
@@ -1820,17 +1813,27 @@ sub rotate_focus { # The user is tabbing from pane to pane.
 #################################################################################################
 #################################################################################################
 
+sub drawwidgets {
+  for my $w (@widget) {
+    redraw_widget($w, $screen);
+  }
+}
+
 sub doeggwidget {
   my ($w, $s, @more) = @_;
+  $$w{bg} ||= "black";
   my %moropt = @more;
   my $hbg = $opt{focusbgcolor} || $$w{focusbg} || "black";
   my $bg  = (($$w{id} eq $$wfocus{id}) ? $hbg : undef) ||
     ($$w{transparent} ? '__TRANSPARENT__' : $$w{bg}) ||
     '__TRANSPARENT__';
   debuglog("Drawing widget $$w{id} ($$w{type}/$$w{subtype}, $$w{fg}/$$w{focusbg}, $$w{transparent}) on a $bg background.");
+  debuglog("Geometry: ($$w{x},$$w{y}) / ($$w{xmax},$$w{ymax})");
   #if ($$w{redraw} or $bg) {
-    blankrect($s, $$w{x}, $$w{y}, $$w{xmax} - 1, $$w{ymax} - 1, ($bg eq "__TRANSPARENT__" ? $bg : clr($bg, "bg")));
-    doborder($w, $s);
+  blankrect($s, $$w{x}, $$w{y}, $$w{xmax} - 1, $$w{ymax} - 1,
+            #($bg eq "__TRANSPARENT__" ? $bg : clr($bg, "bg"))
+            widgetbg($w), " ", widgetfg($w));
+  doborder($w, $s);
   #}
   my $n = 0;
   for my $i (windowitems($w)) {
@@ -1846,6 +1849,11 @@ sub doeggwidget {
                   transparent => $$w{transparent},
                 }, $s);
       }
+      debuglog(qq[window $$w{id}, item $n, $$i{name} at (]
+               . ($$w{x} + 1 + ($$i{key} ? 2 : 0))
+               . ","
+               . ($$w{y} + $n)
+               . qq[), ] . ($$i{fg} || $$w{fg}) . " on $$w{bg}");
       dotext(+{ id          => $$w{id} . "_label_" . $n,
                 text        => substr($$i{name}, 0, $$w{xmax} -$$w{x} - 2),
                 x           => $$w{x} + 1 + ($$i{key} ? 2 : 0),
@@ -1871,803 +1879,14 @@ sub doeggwidget {
 
 sub dowidget {
   my ($w, $s, @more) = @_;
-  if ($$w{type} eq "clock") {
-    doclock($w, $s, @more);
-  } elsif ($$w{type} eq "label") {
-    dotext($w, $s, @more);
-  } elsif ($$w{type} eq "tictactoe") {
-    dotictactoe($w, $s, @more);
-  } elsif ($$w{type} eq "diffuse") {
-    dodiffuse($w, $s, @more);
-  } elsif ($$w{type} eq "notepad") {
-    donotepad($w, $s, @more);
-  } elsif ($$w{type} eq "bargraph") {
-    dobargraph($w, $s, @more);
-  } elsif ($$w{type} eq "logtail") {
-    dologtail($w, $s, @more);
+  if (is_standard_widget($w)) {
+    dostandardwidget($w, $s, @more);
   } elsif ($$w{type} eq "egggame") {
     doeggwidget($w, $s, @more);
-  } elsif ($$w{type} eq "messagelog") {
-    domessagelog($w, $s, @more);
-  } elsif ($$w{type} eq "ordkey") {
-    doordkey($w, $s, @more);
   } else {
+    widgetlog("unhandled widget type, '$$w{type}'");
     dotext($w, $s, @more);
   }
-}
-
-sub drawwidgets {
-  for my $w (@widget) {
-    redraw_widget($w, $screen);
-  }
-}
-
-sub redraw_widget {
-  my ($w, $s) = @_;
-  dowidget($w, $s, "redrawonly" => 1);
-}
-
-sub dologtail {
-  #use File::Tail;
-  my ($w, $s, %more)  = @_;
-  $$w{__LINES__}    ||= +[];
-  if (not $more{redrawonly}) {
-    $$w{logfile}      ||= $0;
-    $$w{logfile}        = $0 if not -e $$w{logfile};
-    #$$w{__FILETAIL__} ||= File::Tail->new($$w{logfile});
-    $$w{title}        ||= $$w{logfile};
-    $$w{contentsizex} ||= $xmax - $$w{x} - 2;
-    $$w{contentsizey} ||= $ymax - $$w{y} - 2;
-    $$w{__PADDING__}  ||= " " x $$w{contentsizex};
-    my $line;
-    #while (defined($line=$$w{__FILETAIL__}->read)) {
-    #  chomp $line;
-    #  push @{$$w{__LINES__}}, $line;
-    #}
-    #while ($$w{contentsizey} < scalar @{$$w{__LINES__}}) {
-    #  shift @{$$w{__LINES__}};
-    #}
-    open LOGTAIL, "<", $$w{logfile};
-    seek LOGTAIL,-1, 2;  #get past last eol
-    my $count=0; my $byte;
-    while (1) {
-      seek LOGTAIL, -1,1;
-      read LOGTAIL, $byte, 1;
-      if (ord($byte) == 10) {
-        $count++;
-        last if $count == $$w{contentsizey};
-      }
-      seek LOGTAIL,-1,1;
-      last if (tell LOGTAIL == 0);
-    }
-    local $/ = undef;
-    my $tail = <LOGTAIL>; close LOGTAIL;
-    $$w{__LINES__} = +[ map { chomp $_; $_ } split /\r?\n/, $tail ];
-  }
-  if (not $$w{__DIDBORDER__}) {
-    doborder($w, $s);
-    $$w{__DIDBORDER__} = 1 unless $$w{redraw};
-  }
-  for my $n (1 .. $$w{contentsizey}) {
-    my $line = $$w{__LINES__}[$n - 1] || "";
-    dotext(+{ id          => $$w{id} . "_line" . $n,
-              text        => substr(($line . $$w{__PADDING__}), 0, $$w{contentsizex}),
-              x           => $$w{x} + 1,
-              y           => $$w{y} + $n,
-              transparent => $$w{transparent},
-              bg          => $$w{bg},
-              fg          => $$w{fg},
-            }, $s);
-  }
-}
-
-sub dobargraph {
-  my ($w, $s, %more) = @_;
-  if (not $more{redrawonly}) {
-    $$w{iter}         ||= 0;
-    $$w{bars}         ||= 1 + ($$w{x} + 22 < $xmax) ? 20 : ($xmax - $$w{x} - 2);
-    $$w{bars}           = 1 if $$w{bars} < 1;
-    $$w{contentsizex} ||= $$w{bars};
-    $$w{contentsizey} ||= 5;
-    $$w{threshhold}   ||= [5, 15, 25, 35];
-    $$w{palette}      ||= "green"; # See %grad in createbggradient
-    $$w{gradient}     ||= createbggradient($w);
-    $$w{data} ||= +[ map { bgdatum($w, 0) } 1 .. $$w{bars}];
-    $$w{minval}       ||= 0;
-    $$w{maxval}       ||= $$w{contentsizey} * 8;
-    $$w{avgval}       ||= $$w{minval} + (($$w{maxval} - $$w{minval}) / 3);
-    push @{$$w{data}}, getnextbgdatum($w);
-    shift @{$$w{data}};
-    debuglog(Dumper($w));
-  }
-  if (not $$w{__DIDBORDER__}) {
-    doborder($w, $s);
-    $$w{__DIDBORDER__} = 1 unless $$w{redraw};
-  }
-  for my $n (1 .. $$w{contentsizey}) {
-    for my $b (0 .. ($$w{bars} - 1)) {
-      my $x = $$w{x} + 1 + $b;
-      my $y = $$w{y} + $$w{contentsizey} + 1 - $n;
-      $$s[$x][$y] = +{ fg   => $$w{data}[$b]{fg} || widgetfg($w),
-                       bg   => widgetbg($w, undef, $$s[$x][$y]),
-                       char => $$w{data}[$b]{char}[($n - 1)], };
-    }
-  }
-}
-
-sub createbggradient {
-  my ($w) = @_;
-  $$w{palette} ||= "green";
-  $$w{palette} = "green" if $$w{palette} eq "default";
-  my %grad = ( green   => +{ start  => +{ h => 151, s =>  37, v =>  80, },
-                             finish => +{ h => 100, s => 100, v =>  50, }},
-               rainbow => +{ start  => +{ h => 272, s => 100, v => 100, },
-                             finish => +{ h =>   0, s =>  93, v => 100, }},
-             );
-  my $steps = scalar(@{$$w{threshhold}});
-  my %delta = map {
-    $_ => (($grad{$$w{palette}}{finish}{$_} - $grad{$$w{palette}}{start}{$_}) / $steps),
-  } qw(h s v);
-  my %current = map { $_ => $grad{$$w{palette}}{start}{$_} } qw(h s v);
-  my @c = ();
-  for my $s (0 .. $steps) {
-    my @min = (($$w{minval} || 0), @{$$w{threshhold}});
-    push @c, +{ min => $min[$s],
-                h   => $current{h},
-                s   => $current{s},
-                v   => $current{v},
-              };
-    $current{$_} += $delta{$_} for qw(h s v);
-  }
-  @c = map { my $c = hsv2rgb($_);
-             #$$c{rgb} = rgb($$c{r}, $$c{g}, $$c{b});
-             $c
-           } @c;
-  #use Data::Dumper; print Dumper(+{ delta    => \%delta,
-  #                                  current  => \%current,
-  #                                  gradient => \@c,
-  #                                  palette  => $$w{palette},
-  #                                  gradspec => $grad{$$w{palette}},
-  #                                }); <STDIN>;
-  return \@c;
-}
-
-sub getnextbgdatum {
-  my ($w) = @_;
-  if ($$w{datasource} eq "load") {
-    my ($up, $users, $oneminuteload, $fiveminuteload, $fifteenminuteload) = uptime();
-    $$w{corecount} ||= countcpucores($w);
-    return bgdatum($w, $oneminuteload # In principle, this number goes from 0 to the number of CPU cores.
-                   * $$w{maxval} / (($$w{headroomratio} || 2) * ($$w{corecount} || 1)));
-  } else {
-    return fakenextbgdatum($w);
-  }
-}
-
-sub countcpucores {
-  my ($w) = @_; # Probably don't actually need this.
-  open INFO, "<", "/proc/cpuinfo";
-  my $count = 0;
-  while (<INFO>) {
-    if (/^processor\s*[:]\s*(\d+)/) {
-      $count++;
-    }
-  }
-  close INFO;
-  return $count;
-}
-
-sub fakenextbgdatum {
-  my ($w) = @_;
-  $$w{hist} ||= +[ map { $$w{avgval} } 1 .. 40 ];
-  my $totalhist = 60 * $$w{avgval};# + (5 * $$w{maxval}) + (5 * $$w{minval});
-  for my $h (@{$$w{hist}}) { $totalhist += $h }
-  my $avg = $totalhist / 100;
-  my $num = $avg;
-  $$w{flutter} ||= ($$w{maxval} / 20);
-  my $flutter = rand($$w{flutter});
-  $num = $num - ($$w{flutter} / 2) + $flutter;
-  if ($$w{spikeprob} > rand 100) {
-    $$w{spike} ||= ($$w{maxval} / 8);
-    my $spike = rand($$w{spike});
-    $num += rand $spike;
-  }
-  $num = $$w{minval} if $num < $$w{minval};
-  $num = $$w{maxval} if $num > $$w{maxval};
-  my $d = bgdatum($w, $num);
-  push @{$$w{hist}}, $$d{number};
-  shift @{$$w{hist}};
-  return $d;
-}
-
-sub bgdatum {
-  my ($w, $number) = @_;
-  $number ||= 0;
-  my $fg = ""; # Foreground color irrelevant if printing a space.
-  for my $c (@{$$w{gradient}}) {
-    $fg = rgb($$c{r}, $$c{g}, $$c{b}) if $$c{min} <= $number;
-  }
-  my @block = ( +{ min => (1/8), char => "▁" },
-                +{ min => (2/8), char => "▂" },
-                +{ min => (3/8), char => "▃" },
-                +{ min => (4/8), char => "▄" },
-                +{ min => (5/8), char => "▅" },
-                +{ min => (6/8), char => "▆" },
-                +{ min => (7/8), char => "▇" },
-                +{ min => (8/8), char => "█" },
-              );
-  my $valperchar = $$w{maxval} / $$w{contentsizey};
-  my @char = map {
-    my $n = $_;
-    my $c = " ";
-    for my $b (@block) {
-      if ($number > (($n - 1) * $valperchar) + ($$b{min} * $valperchar)) {
-        $c = $$b{char};
-      }}
-    $c
-  } 1 .. $$w{contentsizey};
-  ##print rgb(127,127,127,"bg") . $color . "X"; <STDIN>;
-  return +{ number => $number,
-            iter   => $$w{iter}++,
-            fg     => $fg,
-            char   => \@char,
-          };
-}
-
-sub rewrap_message_log {
-  my ($w) = @_;
-  $$w{msgpos}   = 0;
-  $$w{linepos}  = 0;
-  $$w{xpos}     = 0;
-  $$w{lines}[0] = undef; # The others get cleared when wrapping down
-                         # onto them, but the first line can be a work
-                         # in progress as far as the wrapping code knows.
-  wrap_message_log($w);
-}
-
-sub wrap_message_log {
-  my ($w) = @_;
-  my $msgcount = scalar @{$$w{messages} || +[]};
-  my $first = $$w{msgpos};
-  for my $msgidx ($first .. ($msgcount - 1)) {
-    message_log_wrap_message($w, $msgidx);
-    $$w{msgpos}++;
-  }
-}
-
-sub message_log_wrap_message {
-  my ($w, $idx) = @_;
-  my ($text, $channel) = @{$$w{messages}[$idx]};
-  my $color = $opt{"channelcolor_" . $channel};
-  if (not $color) {
-    # In some special cases, a color is specified directly (e.g., the
-    # color test that is sent when the color depth setting changes).
-    my ($cdef) = grep { $$_{name} eq $channel } @clrdef;
-    $color = $$cdef{name} if ref $cdef;
-    # Last resort, go with the most generic color we've got:
-    $color ||= "grey";
-  }
-  my $width = $$w{xmax} - $$w{x} - 2;
-  if (not exists $$w{lines}[$$w{linepos}]) {
-    $$w{lines}[$$w{linepos}] = [ map { [" ", ""] } 1 .. $width ];
-  }
-  for my $word (split /\s+/, $text) {
-    if (($width < $$w{xpos} + length($word)) and
-        ($width >= length($word))) {
-      $$w{linepos}++; $$w{xpos} = 0;
-      $$w{lines}[$$w{linepos}] = [ map { [" ", ""] } 1 .. $width ];
-    }
-    for my $char (split //, $word) {
-      $$w{lines}[$$w{linepos}][$$w{xpos}] = [$char, $color];
-      $$w{xpos}++;
-      if ($$w{xpos} >= $width) { # Unavoidably split long word:
-        $$w{linepos}++; $$w{xpos} = 0;
-        $$w{lines}[$$w{linepos}] = [ map { [" ", ""] } 1 .. $width ];
-      }
-    }
-    if (($$w{xpos} > 0) and ($$w{xpos} < $width)) {
-      $$w{lines}[$$w{linepos}][$$w{xpos}] = [" ", $color];
-      $$w{xpos}++;
-    }
-  }
-  if ($$w{onemessageperline}) {
-    $$w{linepos}++; $$w{xpos} = 0;
-  }
-}
-
-sub domessagelog {
-  my ($w, $s, %more) = @_;
-  if ($$w{redraw}) {
-    doborder($w, $s);
-  }
-  wrap_message_log($w); # Adds any new messages.
-  my $width = $$w{xmax} - $$w{x} - 2;
-  my $height = $$w{ymax} - $$w{y} - 2;
-  my @line = @{$$w{lines}};
-  # TODO: scrollpos
-  while ($height < scalar @line) {
-    shift @line;
-  }
-  my $y = 0;
-  for my $l (@line) {
-    $y++;
-    for my $x (1 .. $width) {
-      $$s[$$w{x} + $x][$$w{y} + $y] = +{ bg   => widgetbg($w, "bg", $$s[$$w{x} + $x][$$w{y} + $y]),
-                                         fg   => clr($$l[$x - 1][1]),
-                                         char => $$l[$x - 1][0],
-                                       },
-    }
-  }
-}
-
-sub format_help_info {
-  my ($w, $info) = @_;
-  my $width = $$w{xmax} - $$w{x} - 2;
-  my @line;
-  my ($y, $x) = (0, 0);
-  for my $word (split /\s+/, $info) {
-    if (not exists $line[$y]) {
-      $line[$y] = join("", map { " " } 1 .. $width);
-    }
-    if (($width < $x + length($word)) and
-        ($width >= length($word))) {
-      $y++; $x = 0;
-      $line[$y] = join("", map { " " } 1 .. $width);
-    }
-    for my $char (split //, $word) {
-      substr($line[$y], $x, 1, $char);
-      $x++;
-      if ($x >= $width) { # Unavoidably split long words:
-        $y++; $x = 0;
-        $line[$y] = join("", map { " " } 1 .. $width);
-      }
-    }
-    if (($x > 0) and ($x < $width)) {
-      substr($line[$y], $x, 1, " ");
-      $x++;
-    }
-  }
-  return @line;
-}
-
-sub donotepad {
-  my ($w, $s, %more) = @_;
-  if ((not $$w{xmax}) or (not $$w{ymax})) {
-    $$w{cxmax} = $$w{cymax} = 0;
-    for my $k (grep { /^line/ } keys %$w) {
-      my ($n) = $k =~ /(\d+)/;
-      $$w{cymax} = $n if $$w{cymax} < $n;
-      if (not $$w{__DID_UNESCAPES__}) {
-        $$w{$k} = notepad_unescape($$w{$k});
-      }
-      $$w{cxmax} = 1 + length($$w{$k}) if $$w{cxmax} <= length($$w{$k});
-    }
-    $$w{xmax} = $$w{x} + $$w{cxmax} + 2;
-    $$w{ymax} = $$w{y} + $$w{cymax} + 2;
-    $$w{__DID_UNESCAPES__} = 1;
-  }
-  $$w{contentsizex} ||= $$w{xmax} - $$w{x} - 2;
-  $$w{contentsizey} ||= $$w{ymax} - $$w{y} - 2;
-  doborder($w,$s);
-  for my $n (1 .. ($$w{ymax} - $$w{y} - 2)) {
-    my $id = $$w{id} . "_line" . $n;
-    dotext(+{ id          => $id,
-              text        => substr((($$w{"line" . $n} || "") .
-                                     (" " x ($$w{xmax} - $$w{x} - 2)), 0, ($$w{xmax} - $$w{x} - 2))),
-              x           => $$w{x} + 1,
-              y           => $$w{y} + $n,
-              bg          => $$w{bg},
-              fg          => $$w{fg},
-              transparent => $$w{transparent},
-            }, $s);
-  }
-}
-
-sub doordkey {
-  # The content gets changed on keyboard input in a different way,
-  # but display is the same as a note pad:
-  donotepad(@_);
-}
-
-sub dodiffuse {
-  my ($w, $s, %more) = @_;
-  if ($opt{colordepth} < 24) {
-    blankrect($s, $$w{x}, $$w{y}, $$w{x} + $$w{contentsizex}, $$w{y} + $$w{contentsizey}, $reset);
-  } else {
-    if (not $more{redrawonly}) {
-      $$w{x}            ||= 0;
-      $$w{y}            ||= 0;
-      $$w{xmax}         ||= $xmax;
-      $$w{ymax}         ||= $ymax;
-      $$w{contentsizex} ||= 1 + $$w{xmax} - $$w{x};
-      $$w{contentsizey} ||= 1 + $$w{ymax} - $$w{y};
-      $$w{title}        ||= "Diffuse";
-      $$w{fade}         ||= (0.05 + rand(0.5));
-      $$w{paintprob}    ||= 5 + int rand 5;
-      $$w{fudge}        ||= 65535 + int rand 65535;
-      $$w{offset}         = (defined $$w{offset}) ? $$w{offset} : 2; # Allow edges to behave as middle
-      $$w{c} ||= 0;
-      $$w{map} ||= +[ map {
-        [ map {
-          +{ r => 0, g => 0, b => 0 };
-        } 0 .. ($$w{ymax} + 2 * $$w{offset}) ]
-      } 0 .. ($$w{xmax} + 2 * $$w{offset}) ];
-      if ($$w{preseed} and not $$w{__DID_PRESEED__}) {
-        $$w{__DID_PRESEED__}++;
-        for (1 .. $$w{preseed}) {
-          diffuse_addpaint($w);
-        }
-      }
-    }
-    diffuse_draw($w, $s);
-    if (not $more{redrawonly}) {
-      diffuse_diffuse($w);
-      diffuse_addpaint($w) if ($$w{paintprob} > rand 100);
-    }
-  }
-}
-
-sub diffuse_draw {
-  my ($w, $s) = @_;
-  for my $y (0 .. $$w{ymax}) {
-    for my $x (0 .. $$w{xmax}) {
-      my $mx = $x + $$w{offset};
-      my $my = $y + $$w{offset};
-      $$s[$$w{x} + $x][$$w{y} + $y]
-        = +{ bg => rgb(diffuse_scale($$w{map}[$mx][$my]{r}),
-                       diffuse_scale($$w{map}[$mx][$my]{g}),
-                       diffuse_scale($$w{map}[$mx][$my]{b}), "bg"),
-             fg   => "", # irrelevant
-             char => " ", };
-    }}
-}
-
-sub diffuse_diffuse {
-  my ($w) = @_;
-  my @old = map {
-    [ map { my $x = $_;
-            +{ r => $$x{r}, g => $$x{g}, b => $$x{b}, };
-          } @$_ ]
-  } @{$$w{map}};
-  for my $x (2 .. ($$w{xmax} + (2 * $$w{offset}) - 2)) {
-    for my $y (1 .. ($$w{ymax} + (2 * $$w{offset}) - 1)) {
-      for my $color (qw(r g b)) {
-        $$w{map}[$x][$y]{$color} = abs(((1 * $old[$x - 2][$y - 1]{$color}) +
-                                        (2 * $old[$x - 2][$y]{$color})     +
-                                        (1 * $old[$x - 2][$y + 1]{$color}) +
-                                        (2 * $old[$x - 1][$y - 1]{$color}) +
-                                        (3 * $old[$x - 1][$y]{$color})     +
-                                        (2 * $old[$x - 1][$y + 1]{$color}) +
-                                        (3 * $old[$x][$y - 1]{$color})     +
-                                        (5 * $old[$x][$y]{$color})         +
-                                        (3 * $old[$x][$y + 1]{$color})     +
-                                        (2 * $old[$x + 1][$y - 1]{$color}) +
-                                        (3 * $old[$x + 1][$y]{$color})     +
-                                        (2 * $old[$x + 1][$y + 1]{$color}) +
-                                        (1 * $old[$x + 2][$y - 1]{$color}) +
-                                        (2 * $old[$x + 2][$y]{$color})     +
-                                        (1 * $old[$x + 2][$y + 1]{$color}))
-                                       / (33 + $$w{fade}));
-        # Fix floating-point underflow:
-        $$w{map}[$x][$y]{$color} = int($$w{map}[$x][$y]{$color} * $$w{fudge}) / $$w{fudge};
-      }}}
-}
-
-sub diffuse_addpaint {
-  my ($w) = @_;
-  my $c = +{ map { ( $_ => rand 5000 ) } qw(r g b) };
-  my $x = $$w{offset} + 1 + int rand($$w{xmax} - 2);
-  my $y = $$w{offset} + 1 + int rand($$w{ymax} - 2);
-  for (1 .. 1 + int rand 3) {
-    for my $z (qw(r g b)) {
-      $$w{map}[$x][$y]{$z} += $$c{$z};
-    }
-    $x += (($x > ($$w{xmax} / 2)) ? -1 : 1) * (1 + int rand ($$w{xsplatter} || $$w{splatter} || 5));
-    $y += (($y > ($$w{ymax} / 2)) ? -1 : 1) * (1 + int rand ($$w{ysplatter} || $$w{splatter} || 3));
-  }
-}
-
-sub dotictactoe {
-  my ($w, $s, %more) = @_;
-  $$w{title}        ||= "Tic-Tac-Toe";
-  $$w{cols}         ||= 3;
-  $$w{rows}         ||= 3;
-  $$w{squaresizex}  ||= 5;
-  $$w{squaresizey}  ||= 3;
-  $$w{paddingx}     ||= 2;
-  $$w{paddingy}     ||= 1;
-  $$w{contentsizex} ||= ($$w{squaresizex} * $$w{cols}) + ($$w{cols} - 1) + (2 * $$w{paddingx});
-  $$w{contentsizey} ||= ($$w{squaresizey} * $$w{rows}) + ($$w{rows} - 1) + (2 * $$w{paddingy});
-  $$w{board}        ||= [ map { [map { " " } 1 .. $$w{rows}] } 1 .. $$w{cols}];
-  $$w{turn}         ||= "X";
-  $$w{iter}         ||= 0; $$w{iter}++;
-  if (not $$w{__DIDBOARD__}) {
-    $$w{title} = $$w{iter} . ($more{redrawonly} ? "R" : "") . ":" . $$w{__INTERVAL_POS__} . "/" . $$w{interval}
-      if $$w{debugiter};
-    doborder($w,$s);
-    blankrect($s, $$w{x} + 1, $$w{y} + 1, $$w{x} + $$w{contentsizex}, $$w{y} + $$w{contentsizey},
-              $$w{transparent} ? '__TRANSPARENT__' : widgetbg($w, "boardbg"));
-    # We're kind of abusing blankrect() to paint foreground here:
-    blankrect($s, $$w{x} + $$w{paddingx} + 1, $$w{y} + $$w{paddingy} + 1,
-              $$w{x} + $$w{paddingx} + ($$w{squaresizex} * $$w{cols}) + 2,
-              $$w{y} + $$w{paddingy} + ($$w{squaresizey} * $$w{rows}) + 2,
-              "", ($$w{boardchar} || "█"), widgetfg($w, "boardfg", "boardbg"));
-    tictactoe_clearboard($w,$s);
-    $$w{__DIDBOARD__} = 1 unless $$w{redraw};
-  }
-  tictactoe_taketurn($w) unless $more{redrawonly};
-  for my $col (1 .. $$w{cols}) {
-    for my $row (1 .. $$w{rows}) {
-      my $tilex  = $$w{x} + $$w{paddingx} + (($col - 1) * ($$w{squaresizex} + 1)) + 1;
-      my $tiley  = $$w{y} + $$w{paddingy} + (($row - 1) * ($$w{squaresizey} + 1)) + 1;
-      my $symbol = $$w{board}[$col - 1][$row - 1];
-      $$s[$tilex + int($$w{squaresizex} / 2)][$tiley + int($$w{squaresizey} / 2)] =
-        +{ fg    => widgetfg($w, (lc($symbol) || "blankspace") . "fg"),
-           bg    => widgetbg($w, (lc($symbol) || "blankspace") . "bg"),
-           char  => $symbol, };
-    }
-  }
-}
-
-sub tictactoe_countrow {
-  my ($w, $y) = @_;
-  my $counts = +{ X => 0, Y => 0, " " => 0 };
-  for my $x (0 .. ($$w{cols} - 1)) {
-    $$counts{$$w{board}[$x][$y]}++;
-  }
-  return $counts;
-}
-
-sub tictactoe_countcol {
-  my ($w, $x) = @_;
-  my $counts = +{ X => 0, Y => 0, " " => 0 };
-  for my $y (0 .. ($$w{rows} - 1)) {
-    $$counts{$$w{board}[$x][$y]}++;
-  }
-  return $counts;
-}
-
-sub tictactoe_countdiagonal {
-  my ($w, $dir) = @_;
-  my $counts = +{ X => 0, Y => 0, " " => 0 };
-  for my $x (0 .. ($$w{cols} - 1)) {
-    my $y = ($dir > 0) ? $x : ($$w{cols} - $x - 1);
-    $$counts{$$w{board}[$x][$y]}++;
-  }
-  return $counts;
-}
-
-sub tictactoe_taketurn {
-  my ($w) = @_;
-  if ($$w{turn} > 0) {
-    $$w{turn}--;
-    if ($$w{turn} == 0) {
-      $$w{board} = [ map { [map { " " } 1 .. $$w{rows}] } 1 .. $$w{cols}];
-    }
-    return;
-  }
-  my $opponent = ($$w{turn} eq "X") ? "O" : "X";
-  my @score = sort { $$b[0] <=> $$a[0] } sort { $$a[3] <=> $$b[3] } map {
-    my $x = $_;
-    map {
-      my $y = $_;
-      my $colcount = tictactoe_countcol($w, $x);
-      my $rowcount = tictactoe_countrow($w, $y);
-      my ($diacounta, $diacountb) = +{ map { $_ => 0 } ("X", "O", " ") };
-      if ($$w{rows} == $$w{cols}) {
-        if ($x == $y) {
-          $diacounta = tictactoe_countdiagonal($w, 1); }
-        if ($x + $y == 0) {
-          $diacountb = tictactoe_countdiagonal($w, -1); }
-      }
-      my $score = 500 * $$rowcount{$$w{turn}} + 500 * $$colcount{$$w{turn}}
-        + 500 * $$diacounta{$$w{turn}}        + 500 * $$diacountb{$$w{turn}}
-        + 300 * $$rowcount{$opponent}         + 300 * $$colcount{$opponent}
-        + 300 * $$diacounta{$opponent}        + 300 * $$diacountb{$opponent}
-        +  25 * $$diacounta{" "}              + 25 * $$diacountb{" "} # prefer diagonals generally
-        + 1;
-      if (($$w{board}[$x][$y] eq "X") or ($$w{board}[$x][$y] eq "O")) {
-        $score = -1;
-      }
-      [$score, $x, $y, rand 1000];
-    } 0 .. ($$w{rows} - 1)
-  } 0 .. ($$w{cols} - 1);
-  $$w{board}[$score[0][1]][$score[0][2]] = $$w{turn};
-  $$w{turn} = $opponent;
-  if (tictactoe_complete($w, $score[0][1], $score[0][2])) {
-    $$w{turn} = $$w{windelay} || 5;
-  }
-}
-
-sub tictactoe_complete {
-  # Check whether the move that was just made completed the game.
-  # Does not loop over all positions, because that's unnecessary.
-  my ($w, $x, $y) = @_;
-  my $colcount  = tictactoe_countcol($w, $x);
-  my $rowcount  = tictactoe_countrow($w, $y);
-  my $diacounta = tictactoe_countdiagonal($w,1);
-  my $diacountb = tictactoe_countdiagonal($w,-1);
-  return
-    (($$colcount{X} == $$w{cols}) or ($$colcount{O} == $$w{cols}) or
-     ($$rowcount{X} == $$w{rows}) or ($$rowcount{O} == $$w{rows}) or
-     (($$w{cols} == $$w{rows}) and
-      (($$diacounta{X} == $$w{cols}) or ($$diacounta{O} == $$w{cols}) or
-       ($$diacountb{X} == $$w{cols}) or ($$diacountb{O} == $$w{cols}))));
-}
-
-sub tictactoe_clearboard {
-  my ($w, $s) = @_;
-  for my $col (1 .. $$w{cols}) {
-    for my $row (1 .. $$w{rows}) {
-      my $tilex = $$w{x} + $$w{paddingx} + (($col - 1) * ($$w{squaresizex} + 1)) + 1;
-      my $tiley = $$w{y} + $$w{paddingy} + (($row - 1) * ($$w{squaresizey} + 1)) + 1;
-      blankrect($s, $tilex, $tiley, $tilex + $$w{squaresizex} - 1, $tiley + $$w{squaresizey} - 1,
-                widgetbg($w, "tilebg"), ($$w{tilechar} || " "), widgetfg($w, "tilefg"));
-    }}
-}
-
-sub doclock {
-  my ($w, $s) = @_;
-  my %tzalias = ( localtime => $opt{localtimezone} );
-  my $dt = $$w{faketime}
-    || DateTime->now(
-                     time_zone => ($tzalias{lc $$w{tz}} || $$w{tz}
-                                   || $tzalias{localtime}),
-                    );
-  my $hour = ($dt->hour() % 12); $hour = 12 if $hour < 1;
-  $hour = sprintf("%02d",$dt->hour()) if $$w{military};
-  my @tpart = ( +[hour => $hour, "fg", "bg"] );
-  if (($dt->hour() == 12) and ($dt->minute() < 1)) {
-    @tpart = ( +[hour => "Noon", "fg", "bg"] );
-  } elsif (($dt->hour() == 0) and ($dt->minute() < 1)) {
-    my @tpart = ( +[hour => "Midnight", "fg", "bg"] );
-  } else {
-    push @tpart, [colona => ":", "colonfg", "colonbg"];
-    push @tpart, [minute => sprintf("%02d", $dt->minute()) => "minutefg", "minutebg" ];
-    if ($$w{showseconds}) {
-      push @tpart, [colonb => ":", "colonfg", "colonbg"];
-      push @tpart, [second => sprintf("%02d", $dt->second()), "secondfg", "secondbg" ];
-    }
-    push @tpart, [pm => "pm", "pmfg", "pmbg" ]
-      if (($dt->hour >= 12) and (not $$w{military}));
-    push @tpart, [am => "am", "pmfg", "pmbg" ]
-      if (($dt->hour < 12) and $$w{showam});
-    # Having the sense not to set showam and military for the
-    # same clock widget is left as an exercise for the configurer.
-  }
-  my $time = join "", map { $$_[1] } @tpart;
-  my $clen = length($time);
-  if (not ($$w{minutefg} || $$w{secondfg} || $$w{colonfg})) {
-    @tpart = ( +[ time => $time => "fg" => "bg" ]);
-  }
-  my $date = $dt->year() . "-" . $dt->month_abbr() . "-" . $dt->mday();
-  if ($$w{showdate} and (length($date) > $clen))    { $clen = length($date); }
-  if ($$w{title} and (length($$w{title}) > $clen))  { $clen = length($$w{title}); }
-  if ($$w{showdow} and length($dt->day_name()) > $clen) { $clen = length($dt->day_name()); }
-  if ($$w{contentsizex} and $$w{contentsizey}) {
-    # Blank at the _previous_ size (in case it is shrinking):
-    blankrect($s, $$w{x}, $$w{y}, $$w{x} + $$w{contentsizex} + 1, $$w{y} + $$w{contentsizey} + 1,
-              widgetbg($w), " "); #"░", widgetfg($w));
-  }
-  $$w{contentsizey} = 1 + ($$w{showdate} ? 1 : 0) + ($$w{showdow} ? 1 : 0);
-  $$w{contentsizex} = $clen;
-  blankrect($s, $$w{x}, $$w{y}, $$w{x} + $$w{contentsizex} + 1, $$w{y} + $$w{contentsizey} + 1,
-            widgetbg($w), " ");
-  doborder($w,$s);
-  my $pos = $$w{x} + 1 + (($clen > length($time))
-                          ? (int(($clen - length($time)) / 2)) : 0);
-  for my $p (@tpart) {
-    dotext(+{ id          => $$w{id} . "_" . $$p[0],
-              x           => $pos,
-              y           => $$w{y} + 1,
-              fg          => $$w{$$p[2]} || $$w{fg},
-              bg          => $$w{$$p[3]} || $$w{bg},
-              text        => $$p[1],
-              transparent => $$w{transparent},
-            }, $s);
-    $pos += length($$p[1]);
-  }
-  if ($$w{showdow}) {
-    dotext(+{ id          => $$w{id} . "_dow",
-              x           => $$w{x} + 1 + (($clen > length($dt->day_name()))
-                                           ? (int(($clen - length($dt->day_name())) / 2)) : 0),
-              y           => $$w{y} + 2,
-              fg          => $$w{dowfg}  || $$w{datefg} || $$w{fg},
-              bg          => $$w{dowbg}  || $$w{datebg} || $$w{bg},
-              text        => $dt->day_name(),
-              transparent => $$w{transparent},
-            }, $s);
-  }
-  if ($$w{showdate}) {
-    dotext(+{ id          => $$w{id} . "_date",
-              x           => $$w{x} + 1 + (($clen > length($date))
-                                           ? (int(($clen - length($date)) / 2)) : 0),
-              y           => $$w{y} + 2 + ($$w{showdow} ? 1 : 0),
-              fg          => $$w{datefg} || $$w{fg},
-              bg          => $$w{datebg} || $$w{bg},
-              text        => $date,
-              transparent => $$w{transparent},
-            }, $s);
-  }
-}
-
-sub blankrect {
-  my ($s, $minx, $miny, $maxx, $maxy, $bg, $c, $fg) = @_;
-  for my $x ($minx .. $maxx) {
-    for my $y ($miny .. $maxy) {
-      $$s[$x][$y] = +{ bg   => ($bg eq '__TRANSPARENT__') ? $$s[$x][$y]{bg} : $bg,
-                       fg   => ($fg || ""),
-                       char => ((defined $c) ? $c : " "),
-                     };
-    }}}
-
-sub doborder {
-  my ($w, $s) = @_;
-  my $fg = widgetfg($w, "borderfg");
-  $$s[$$w{x}][$$w{y}] = +{ char => "╔", fg => $fg, bg => widgetbg($w, "borderbg", $$s[$$w{x}][$$w{y}]) };
-  $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y}] = +{ char => "╗", fg => $fg, bg => widgetbg($w, "borderbg", $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y}]) };
-  $$s[$$w{x}][$$w{y} + $$w{contentsizey} + 1] = +{ char => "╚", fg => $fg, bg => widgetbg($w, "borderbg", $$s[$$w{x}][$$w{y} + $$w{contentsizey} + 1]) };
-  $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y} + $$w{contentsizey} + 1]
-    = +{ char => "╝", fg => $fg, bg => widgetbg($w, "borderbg", $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y} + $$w{contentsizey} + 1]) };
-  for my $x (1 .. $$w{contentsizex}) {
-    $$s[$$w{x} + $x][$$w{y}] = +{ char => "═", fg => $fg, bg => widgetbg($w, "borderbg", $$s[$$w{x} + $x][$$w{y}]) };
-    $$s[$$w{x} + $x][$$w{y} + $$w{contentsizey} + 1] = +{ char => "═", fg => $fg, bg => widgetbg($w, "borderbg", $$s[$$w{x} + $x][$$w{y} + $$w{contentsizey} + 1]) };
-  }
-  for my $y (1 .. $$w{contentsizey}) {
-    $$s[$$w{x}][$$w{y} + $y] = +{ char => "║", fg => $fg, bg => widgetbg($w, "borderbg", $$s[$$w{x}][$$w{y} + $y]) };
-    $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y} + $y] = +{ char => "║", fg => $fg, bg => $reset . widgetbg($w, "borderbg", $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y} + $y]) };
-  }
-  if ($$w{title}) {
-    dotext(+{ id          => $$w{id} . "_title",
-              x           => $$w{x} + 1 + (($$w{contentsizex} > length($$w{title}))
-                                           ? (int(($$w{contentsizex} - length($$w{title})) / 2)) : 0),
-              y           => $$w{y},
-              fg          => ($$w{id} eq $$wfocus{id}) ? "white" : $$w{titlefg} || $$w{borderfg} || $$w{fg},
-              bg          => $$w{titlebg} || $$w{borderbg} || $$w{bg},
-              text        => $$w{title},
-              transparent => $$w{transparent},
-            }, $s);
-  }
-}
-
-sub dotext {
-  my ($t, $s) = @_;
-  my ($ut, $users) = uptime();
-  my %magictext = ( __UPTIME__ => $ut,
-                    __USERS__  => $users . " users", );
-  if (not $$t{__DONE__}) {
-    my $text = (defined $$t{text}) ? $$t{text} : $$t{title} || $$t{type} || "t_$$t{id}";
-    $text = $magictext{$text} || $text;
-    $$t{rows} = 1;
-    $$t{cols} = length $text;
-    my $x = ($$t{x} >= 0) ? $$t{x} : ($xmax + $$t{x} - $$t{cols});
-    for my $c (split //, $text) {
-      $$s[$x][$$t{y}] = +{ bg   => widgetbg($t, "bg", $$s[$x][$$t{y}]),
-                           fg   => widgetfg($t),
-                           char => $c };
-      $x++;
-    }
-  }
-}
-
-sub widgetfg {
-  my ($w, $fgfield) = @_;
-  return "" if $opt{colordepth} < 4;
-  $fgfield ||= "fg"; $fgfield = "fg" if not $$w{$fgfield};
-  return #(ref $$w{$fgfield}) ? rgb(@{$$w{$fgfield}}) :
-    clr($$w{$fgfield}) || "";
-}
-
-sub widgetbg {
-  my ($w, $bgfield, $old) = @_;
-  return "" if $opt{colordepth} < 4;
-  $bgfield ||= ($$w{id} eq $$wfocus{id}) ? "focusbg" : "bg";
-  $bgfield = "bg" if not $$w{$bgfield};
-  if ($$w{transparent} and $$w{id} ne $$wfocus{id}) {
-    return $$old{bg} if $$old{bg};
-  }
-  return #(ref $$w{$bgfield}) ? rgb(@{$$w{$bgfield}},"bg") :
-    clr($$w{$bgfield} || "black", "bg") || "";
 }
 
 #################################################################################################
@@ -2934,37 +2153,37 @@ sub changed_color_depth {
 
 sub redraw {
   rewrap_message_log($wmessages);
-  refreshscreen();      # Clear artifacts from $screen, and redo the layout.
-  drawwidgets();        # Populate $screen
-  drawscreen();         # Actually draw $screen to terminal
+  refreshscreen();         # Clear artifacts from $screen, and redo the layout.
+  drawwidgets();           # Populate $screen
+  draweggscreen();         # Actually draw $screen to terminal
 }
 
-sub drawscreen {
-  my ($s) = @_;
-  if ($opt{nohome}) {
-    print $reset . "\n\n";
-  } else {
-    print chr(27) . "[H" . $reset;
-  }
-  for my $y (0 .. $ymax) {
-    if (not ($y == $ymax)) {
-      print gotoxy(0, $y);
-      print $reset;
-    }
-    my $lastbg = "";
-    my $lastfg = "";
-    for my $x (0 .. $xmax) {
-      print "" . ((((($$s[$x][$y]{bg} || "") eq $lastbg) and
-                    (($$s[$x][$y]{fg} || "") eq $lastfg))
-                   ? "" : ((($$s[$x][$y]{bg} || "") . ($$s[$x][$y]{fg} || "")) || "")))
-               . (length($$s[$x][$y]{char}) ? ($$s[$x][$y]{char} || " ") : " ")
-        unless (($x == $xmax) and
-                ($y == $ymax) and
-                (not $opt{fullrect}));
-      $lastbg = $$s[$x][$y]{bg} || "";
-      $lastfg = $$s[$x][$y]{fg} || "";
-    }
-  }
+sub draweggscreen {
+  drawscreen($screen, %opt);
+  ## if ($opt{nohome}) {
+  ##   print $reset . "\n\n";
+  ## } else {
+  ##   print chr(27) . "[H" . $reset;
+  ## }
+  ## for my $y (0 .. $ymax) {
+  ##   if (not ($y == $ymax)) {
+  ##     print gotoxy(0, $y);
+  ##     print $reset;
+  ##   }
+  ##   my $lastbg = "";
+  ##   my $lastfg = "";
+  ##   for my $x (0 .. $xmax) {
+  ##     print "" . ((((($$s[$x][$y]{bg} || "") eq $lastbg) and
+  ##                   (($$s[$x][$y]{fg} || "") eq $lastfg))
+  ##                  ? "" : ((($$s[$x][$y]{bg} || "") . ($$s[$x][$y]{fg} || "")) || "")))
+  ##              . (length($$s[$x][$y]{char}) ? ($$s[$x][$y]{char} || " ") : " ")
+  ##       unless (($x == $xmax) and
+  ##               ($y == $ymax) and
+  ##               (not $opt{fullrect}));
+  ##     $lastbg = $$s[$x][$y]{bg} || "";
+  ##     $lastfg = $$s[$x][$y]{fg} || "";
+  ##   }
+  ## }
 }
 
 sub refreshscreen {
@@ -2972,8 +2191,9 @@ sub refreshscreen {
   $screen = +[
               map {
                 [ map {
-                  +{ char => " ",
-                     bg   => clr("black"),
+                  +{ char => "▒",
+                     fg   => "grey",
+                     bg   => "grey",
                    };
                 } 0 .. $ymax ]
               } 0 .. $xmax ];
@@ -2983,16 +2203,14 @@ sub layout {
   ($xmax, $ymax) = Term::Size::chars *STDOUT{IO};
   $xmax ||= 80;
   $ymax ||= 24;
-  $xmax--; #$ymax--; # Term::Size::chars returns counts, not zero-indexed maxima.
-  #$opt{xmax} ||= $xmax;
-  #$opt{ymax} ||= $ymax;
+  $xmax--; $ymax--; # Term::Size::chars returns counts, not zero-indexed maxima.
   $xmax = $opt{xmax} if $opt{xmax} and ($xmax > $opt{xmax});
   $ymax = $opt{ymax} if $opt{ymax} and ($ymax > $opt{ymax});
   my $leftsize  = ($xmax > 100) ? int($xmax / 5) : 20;
   my $rightsize = ($xmax > 100) ? int($xmax / 5) : 20;
   my $msgheight = int($ymax / 2); # TODO: maybe adjust this.
   my $budgetheight = 12;
-  $wbg = +{ x => 0, y => 1, xmax => $xmax, ymax => $ymax,
+  $wbg = +{ x => 0, y => 0, xmax => $xmax + 1, ymax => $ymax + 1,
             type => "diffuse",
             redraw => 1, };
   #if ($ymax > 26) {
@@ -3033,14 +2251,12 @@ sub layout {
   #}
   $wtopbar   = +{ type => "text", title => "Eggs Titlebar", redraw => 0,
                   text => join("", map { " " } 0 .. $xmax),
-                  x => 0, y => 1, xmax => $xmax, ymax => 1,
+                  x => 0, y => 0, xmax => $xmax, ymax => 0,
                   bg => "brown", fg => "azure",
-                  #bg => "black", fg => "indigo",
-                  #bg => "white", fg => "black",
                   #transparent => 0,
                 };
   $wcashflow = +{ type => "egggame", subtype => "cashflow", title => "Cash Flow (F9)", mode => "",
-                  redraw => 1, x => 0, y => 2, xmax => $leftsize - 1,
+                  redraw => 1, x => 0, y => 1, xmax => $leftsize - 1,
                   ymax => $ymax,# - ($wgameclock ? 5 : 0),
                   fg => "gold", focusbg => 'brown', id => $wcount++, transparent => 1,
                   input => sub { input_cashflow(@_); },
@@ -3056,7 +2272,7 @@ sub layout {
                               ],
                 };
   $wmessages = +{ type => "messagelog", subtype => "messages", title => "Messages (F8)", redraw => 1,
-                  x => $leftsize, y => 2, xmax => $xmax - $rightsize - 2, ymax => $msgheight + 1,
+                  x => $leftsize, y => 1, xmax => $xmax - $rightsize - 2, ymax => $msgheight,
                   messages => \@message, lines => \@messageline,
                   msgpos => 0, linepos => 0, xpos => 0,
                   fg => "spring green", focusbg => "grey", id => $wcount++,
@@ -3064,7 +2280,7 @@ sub layout {
                 };
   $wassets = +{ type => "egggame", subtype => "assets", title => "Assets (F7)", redraw => 1,
                 x => $xmax - $rightsize - 1, xmax => $xmax, fg => "indigo", focusbg => "red",
-                y => 2, ymax => $ymax - $budgetheight, id => $wcount++, transparent => 1,
+                y => 1, ymax => $ymax - $budgetheight, id => $wcount++, transparent => 1,
               };
   $wbudget = +{ type => "egggame", subtype => "budget", title => "Budget (F6)", redraw => 1,
                 x => $xmax - $rightsize - 1, xmax => $xmax,
@@ -3075,7 +2291,7 @@ sub layout {
   if ($opt{debug}) {
     $wordkey = +{ type => "ordkey", title => "OrdKey F12", redraw => 1,
                   line1 => "Press Keys",
-                  x => $leftsize, y => $msgheight + 1, xmax => $leftsize + 12, ymax => $ymax,
+                  x => $leftsize, y => $msgheight, xmax => $leftsize + 12, ymax => $ymax,
                   input => sub { input_ordkey(@_); },
                   fg => "purple", #bg => "purple",
                   id => $wcount++,
@@ -3084,14 +2300,14 @@ sub layout {
   my $middlesize = $xmax - $leftsize - $rightsize - ($wordkey ? 12 : 0);
   my $buysize = int($middlesize * 3 / 5) - 1;
   $wbuy = +{ type => "egggame", subtype => "buy", title => "Buy (F3)", redraw => 1,
-             x => $leftsize + ($wordkey ? 12 : 0), y => $msgheight + 1, ymax => $ymax,
+             x => $leftsize + ($wordkey ? 12 : 0), y => $msgheight, ymax => $ymax,
              xmax => $leftsize + ($wordkey ? 12 : 0) + $buysize,
              input => sub { input_buy(@_); },
              fg => "teal", focusbg => "cyan", id => $wcount++,
              transparent => 1,
            };
   $wsettings = +{ type => "egggame", subtype => "settings", title => "Settings (F10)", redraw => 1,
-                  x => $leftsize + ($wordkey ? 12 : 0) + $buysize, y => $msgheight + 1, ymax => $ymax,
+                  x => $leftsize + ($wordkey ? 12 : 0) + $buysize, y => $msgheight, ymax => $ymax,
                   xmax => $xmax - $rightsize - 2,
                   input => sub { input_settings(@_); },
                   fg => "cyan", focusbg => "green", id => $wcount++,
@@ -3109,312 +2325,312 @@ sub layout {
   }
 }
 
-sub hsv2rgb {
-  my ($c) = @_;
-  use Imager::Color;
-  my $hsv = Imager::Color->new( hsv =>  [ $$c{h}, ($$c{v} / 100), ($$c{s} / 100) ] ); # hue, val, sat
-  ($$c{r}, $$c{g}, $$c{b}) = $hsv->rgba;
-  return $c;
-}
-
-sub rgb { # Return terminal code for a 24-bit color.
-  my ($red, $green, $blue, $isbg) = @_;
-  push @message, ["rgb() called at inappropriate color depth.", "bug"]
-    if $opt{colordepth} < 24;
-  my $fgbg = ($isbg) ? 48 : 38;
-  my $delimiter = ";";
-  return "\x1b[$fgbg$ {delimiter}2$ {delimiter}$ {red}"
-    . "$ {delimiter}$ {green}$ {delimiter}$ {blue}m";
-}
-
-sub bg8 {
-  my ($cnum) = @_;
-  return eightbitcolorcode($cnum, "bg");
-}
-sub fg8 {
-  my ($cnum) = @_;
-  return eightbitcolorcode($cnum);
-}
-sub eightbitcolorcode {
-  my ($cnum, $isbg) = @_;
-  my $fgbg = $isbg ? 48 : 38;
-  return chr(27) . qq([$fgbg;5;${cnum}m);
-}
-
-sub color_test {
-  push @message, ["Color Test: ", "meta"];
-  for my $fg (@clrdef) {
-    push @message, [$$fg{name}, $$fg{name}];
-    # TODO: and show that on various backgrounds.
-  }
-}
-
-sub colordefs {
-  # Alphabetical list of keys:
-  # c - cyan
-  # d - gold
-  # e - purple-red
-  # g - green
-  # h - hot pink
-  # i - indigo
-  # k - black
-  # l - blue
-  # m - magenta
-  # n - brown
-  # o - orange
-  # p - pink
-  # q - red-orange
-  # r - red
-  # s - grey (mnemonic: silver)
-  # t - teal
-  # u - purple
-  # v - various (widget-defined)
-  # w - white
-  # x - spring green
-  # y - yellow
-  # z - azure
-  return (+{ name => "white",
-             key    => "w",
-             r      => 250,
-             g      => 250,
-             b      => 250,
-             fg8    => fg8(255),
-             bg8    => bg8(243),
-             ansifg => color("bold white"),
-             ansibg => color("on_white"),
-           },
-          +{ name   => "grey",
-             key    => "s",
-             r      => 200,
-             g      => 200,
-             b      => 200,
-             fg8    => fg8(251),
-             bg8    => bg8(240),
-             ansifg => color("white"),
-             ansibg => color("on_white"),
-           },
-          +{ name   => "black",
-             key    => "k",
-             r      => 128,
-             g      => 128,
-             b      => 128,
-             fg8    => fg8(243),
-             bg8    => bg8(232),
-             ansifg => color("bold black"),
-             ansibg => color("on_black"),
-           },
-          +{ name => "red",
-             key    => "r",
-             r      => 200,
-             g      => 0,
-             b      => 0,
-             fg8    => fg8(160),
-             bg8    => bg8(88),
-             ansifg => color("bold red"),
-             ansibg => color("on_red"),
-           },
-          +{ name   => "red-orange",
-             key    => "q",
-             r      => 255,
-             g      => 100,
-             b      => 0,
-             fg8    => fg8(202),
-             bg8    => bg8(88),
-             ansifg => color("bold red"),
-             ansibg => color("on_red"),
-           },
-          +{ name   => "orange",
-             key    => "o",
-             r      => 255,
-             g      => 126,
-             b      => 0,
-             fg8    => fg8(208),
-             bg8    => bg8(130),
-             ansifg => color("bold red"),
-             ansibg => color("on_red"),
-           },
-          +{ name   => "gold",
-             key    => "d",
-             r      => 255,
-             g      => 176,
-             b      => 0,
-             fg8    => fg8(214),
-             bg8    => bg8(94),
-             ansifg => color("bold yellow"),
-             ansibg => color("on_yellow"),
-           },
-          +{ name   => "yellow",
-             key    => "y",
-             r      => 255,
-             g      => 255,
-             b      => 0,
-             fg8    => fg8(11),
-             bg8    => bg8(94),
-             ansifg => color("bold yellow"),
-             ansibg => color("on_yellow"),
-           },
-          +{ name   => "spring green",
-             key    => "x",
-             r      => 214,
-             g      => 255,
-             b      => 0,
-             fg8    => fg8(190),
-             bg8    => bg8(100),
-             ansifg => color("bold yellow"),
-             ansibg => color("on_yellow"),
-           },
-          +{ name   => "green",
-             key    => "g",
-             r      => 0,
-             g      => 255,
-             b      => 0,
-             fg8    => fg8(46),
-             bg8    => bg8(22),# or 28?
-             ansifg => color("bold green"),
-             ansibg => color("on_green"),
-           },
-          +{ name   => "teal",
-             key    => "t",
-             r      => 50,
-             g      => 240,
-             b      => 153,
-             fg8    => fg8(158),
-             bg8    => bg8(22),# or 29?
-             ansifg => color("bold cyan"),
-             ansibg => color("on_cyan"),
-           },
-          +{ name   => "cyan",
-             key    => "c",
-             r      => 0,
-             g      => 255,
-             b      => 255,
-             fg8    => fg8(44),
-             bg8    => bg8(30),
-             ansifg => color("bold cyan"),
-             ansibg => color("on_cyan"),
-           },
-          +{ name   => "azure",
-             key    => "z",
-             r      => 96,
-             g      => 210,
-             b      => 255,
-             fg8    => fg8(45),
-             bg8    => bg8(31),
-             ansifg => color("bold cyan"),
-             ansibg => color("on_blue"),
-           },
-          +{ name   => "blue",
-             key    => "l",
-             r      => 100,
-             g      => 100,
-             b      => 255,
-             fg8    => fg8(21),
-             bg8    => bg8(18),
-             ansifg => color("bold blue"),
-             ansibg => color("on_blue"),
-           },
-          +{ name   => "indigo",
-             key    => "i",
-             r      => 143,
-             g      => 96,
-             b      => 255,
-             fg8    => fg8(147),
-             bg8    => bg8(17), # or 54
-             ansifg => color("bold blue"),
-             ansibg => color("on_blue"),
-           },
-          +{ name   => "purple",
-             key    => "u",
-             r      => 181,
-             g      => 0,
-             b      => 236,
-             fg8    => fg8(177),
-             bg8    => bg8(53),
-             ansifg => color("bold magenta"),
-             ansibg => color("on_magenta"),
-           },
-          +{ name   => "magenta",
-             key    => "m",
-             r      => 255,
-             g      => 0,
-             b      => 255,
-             fg8    => fg8(201),
-             bg8    => bg8(53),
-             ansifg => color("bold magenta"),
-             ansibg => color("on_magenta"),
-           },
-          +{ name   => "hot pink",
-             key    => "h",
-             r      => 255,
-             g      => 0,
-             b      => 236,
-             fg8    => fg8(199),
-             bg8    => bg8(89),
-             ansifg => color("bold magenta"),
-             ansibg => color("on_magenta"),
-           },
-          +{ name   => "pink",
-             key    => "p",
-             r      => 255,
-             g      => 157,
-             b      => 245,
-             fg8    => fg8(218),
-             bg8    => bg8(138),
-             ansifg => color("bold magenta"),
-             ansibg => color("on_magenta"),
-           },
-          +{ name   => "purple-red",
-             key    => "e",
-             r      => 240,
-             g      => 102,
-             b      => 170,
-             fg8    => fg8(162),
-             bg8    => bg8(52),
-             ansifg => color("bold magenta"),
-             ansibg => color("on_magenta"),
-           },
-          +{ name   => "brown",
-             key    => "n",
-             r      => 219,
-             g      => 161,
-             b      => 57,
-             fg8    => fg8(178),
-             bg8    => bg8(95),
-             ansifg => color("bold magenta"),
-             ansibg => color("on_magenta"),
-           },
-        );
-}
-
-sub clr {
-  my ($cname, $bg) = @_;
-  return "" if $opt{colordepth} < 4;
-  return "" if not $cname;
-  my ($cdef) = grep { $$_{name} eq $cname } @clrdef;
-  die "No such color: $cname" if not ref $cdef;
-  if ($opt{colordepth} >= 24) {
-    if ($bg) {
-      return rgb(int($$cdef{r} / 3), int($$cdef{g} / 3), int($$cdef{b} / 3), $bg);
-    } else {
-      return rgb($$cdef{r}, $$cdef{g}, $$cdef{b});
-    }
-  } elsif ($opt{colordepth} >= 8) {
-    if ($bg) {
-      return $$cdef{ansibg} . $$cdef{bg8};
-    } else {
-      return $$cdef{ansifg} . $$cdef{fg8};
-    }
-  } elsif ($bg) {
-    return $$cdef{ansibg};
-  } else {
-    return $$cdef{ansifg};
-  }
-}
-
-sub gotoxy {
-  my ($x, $y) = @_;
-  return "\033[${y};${x}H";
-}
+## sub hsv2rgb {
+##   my ($c) = @_;
+##   use Imager::Color;
+##   my $hsv = Imager::Color->new( hsv =>  [ $$c{h}, ($$c{v} / 100), ($$c{s} / 100) ] ); # hue, val, sat
+##   ($$c{r}, $$c{g}, $$c{b}) = $hsv->rgba;
+##   return $c;
+## }
+## 
+## sub rgb { # Return terminal code for a 24-bit color.
+##   my ($red, $green, $blue, $isbg) = @_;
+##   push @message, ["rgb() called at inappropriate color depth.", "bug"]
+##     if $opt{colordepth} < 24;
+##   my $fgbg = ($isbg) ? 48 : 38;
+##   my $delimiter = ";";
+##   return "\x1b[$fgbg$ {delimiter}2$ {delimiter}$ {red}"
+##     . "$ {delimiter}$ {green}$ {delimiter}$ {blue}m";
+## }
+## 
+## sub bg8 {
+##   my ($cnum) = @_;
+##   return eightbitcolorcode($cnum, "bg");
+## }
+## sub fg8 {
+##   my ($cnum) = @_;
+##   return eightbitcolorcode($cnum);
+## }
+## sub eightbitcolorcode {
+##   my ($cnum, $isbg) = @_;
+##   my $fgbg = $isbg ? 48 : 38;
+##   return chr(27) . qq([$fgbg;5;${cnum}m);
+## }
+## 
+## sub color_test {
+##   push @message, ["Color Test: ", "meta"];
+##   for my $fg (@clrdef) {
+##     push @message, [$$fg{name}, $$fg{name}];
+##     # TODO: and show that on various backgrounds.
+##   }
+## }
+## 
+## sub colordefs {
+##   # Alphabetical list of keys:
+##   # c - cyan
+##   # d - gold
+##   # e - purple-red
+##   # g - green
+##   # h - hot pink
+##   # i - indigo
+##   # k - black
+##   # l - blue
+##   # m - magenta
+##   # n - brown
+##   # o - orange
+##   # p - pink
+##   # q - red-orange
+##   # r - red
+##   # s - grey (mnemonic: silver)
+##   # t - teal
+##   # u - purple
+##   # v - various (widget-defined)
+##   # w - white
+##   # x - spring green
+##   # y - yellow
+##   # z - azure
+##   return (+{ name => "white",
+##              key    => "w",
+##              r      => 250,
+##              g      => 250,
+##              b      => 250,
+##              fg8    => fg8(255),
+##              bg8    => bg8(243),
+##              ansifg => color("bold white"),
+##              ansibg => color("on_white"),
+##            },
+##           +{ name   => "grey",
+##              key    => "s",
+##              r      => 200,
+##              g      => 200,
+##              b      => 200,
+##              fg8    => fg8(251),
+##              bg8    => bg8(240),
+##              ansifg => color("white"),
+##              ansibg => color("on_white"),
+##            },
+##           +{ name   => "black",
+##              key    => "k",
+##              r      => 128,
+##              g      => 128,
+##              b      => 128,
+##              fg8    => fg8(243),
+##              bg8    => bg8(232),
+##              ansifg => color("bold black"),
+##              ansibg => color("on_black"),
+##            },
+##           +{ name => "red",
+##              key    => "r",
+##              r      => 200,
+##              g      => 0,
+##              b      => 0,
+##              fg8    => fg8(160),
+##              bg8    => bg8(88),
+##              ansifg => color("bold red"),
+##              ansibg => color("on_red"),
+##            },
+##           +{ name   => "red-orange",
+##              key    => "q",
+##              r      => 255,
+##              g      => 100,
+##              b      => 0,
+##              fg8    => fg8(202),
+##              bg8    => bg8(88),
+##              ansifg => color("bold red"),
+##              ansibg => color("on_red"),
+##            },
+##           +{ name   => "orange",
+##              key    => "o",
+##              r      => 255,
+##              g      => 126,
+##              b      => 0,
+##              fg8    => fg8(208),
+##              bg8    => bg8(130),
+##              ansifg => color("bold red"),
+##              ansibg => color("on_red"),
+##            },
+##           +{ name   => "gold",
+##              key    => "d",
+##              r      => 255,
+##              g      => 176,
+##              b      => 0,
+##              fg8    => fg8(214),
+##              bg8    => bg8(94),
+##              ansifg => color("bold yellow"),
+##              ansibg => color("on_yellow"),
+##            },
+##           +{ name   => "yellow",
+##              key    => "y",
+##              r      => 255,
+##              g      => 255,
+##              b      => 0,
+##              fg8    => fg8(11),
+##              bg8    => bg8(94),
+##              ansifg => color("bold yellow"),
+##              ansibg => color("on_yellow"),
+##            },
+##           +{ name   => "spring green",
+##              key    => "x",
+##              r      => 214,
+##              g      => 255,
+##              b      => 0,
+##              fg8    => fg8(190),
+##              bg8    => bg8(100),
+##              ansifg => color("bold yellow"),
+##              ansibg => color("on_yellow"),
+##            },
+##           +{ name   => "green",
+##              key    => "g",
+##              r      => 0,
+##              g      => 255,
+##              b      => 0,
+##              fg8    => fg8(46),
+##              bg8    => bg8(22),# or 28?
+##              ansifg => color("bold green"),
+##              ansibg => color("on_green"),
+##            },
+##           +{ name   => "teal",
+##              key    => "t",
+##              r      => 50,
+##              g      => 240,
+##              b      => 153,
+##              fg8    => fg8(158),
+##              bg8    => bg8(22),# or 29?
+##              ansifg => color("bold cyan"),
+##              ansibg => color("on_cyan"),
+##            },
+##           +{ name   => "cyan",
+##              key    => "c",
+##              r      => 0,
+##              g      => 255,
+##              b      => 255,
+##              fg8    => fg8(44),
+##              bg8    => bg8(30),
+##              ansifg => color("bold cyan"),
+##              ansibg => color("on_cyan"),
+##            },
+##           +{ name   => "azure",
+##              key    => "z",
+##              r      => 96,
+##              g      => 210,
+##              b      => 255,
+##              fg8    => fg8(45),
+##              bg8    => bg8(31),
+##              ansifg => color("bold cyan"),
+##              ansibg => color("on_blue"),
+##            },
+##           +{ name   => "blue",
+##              key    => "l",
+##              r      => 100,
+##              g      => 100,
+##              b      => 255,
+##              fg8    => fg8(21),
+##              bg8    => bg8(18),
+##              ansifg => color("bold blue"),
+##              ansibg => color("on_blue"),
+##            },
+##           +{ name   => "indigo",
+##              key    => "i",
+##              r      => 143,
+##              g      => 96,
+##              b      => 255,
+##              fg8    => fg8(147),
+##              bg8    => bg8(17), # or 54
+##              ansifg => color("bold blue"),
+##              ansibg => color("on_blue"),
+##            },
+##           +{ name   => "purple",
+##              key    => "u",
+##              r      => 181,
+##              g      => 0,
+##              b      => 236,
+##              fg8    => fg8(177),
+##              bg8    => bg8(53),
+##              ansifg => color("bold magenta"),
+##              ansibg => color("on_magenta"),
+##            },
+##           +{ name   => "magenta",
+##              key    => "m",
+##              r      => 255,
+##              g      => 0,
+##              b      => 255,
+##              fg8    => fg8(201),
+##              bg8    => bg8(53),
+##              ansifg => color("bold magenta"),
+##              ansibg => color("on_magenta"),
+##            },
+##           +{ name   => "hot pink",
+##              key    => "h",
+##              r      => 255,
+##              g      => 0,
+##              b      => 236,
+##              fg8    => fg8(199),
+##              bg8    => bg8(89),
+##              ansifg => color("bold magenta"),
+##              ansibg => color("on_magenta"),
+##            },
+##           +{ name   => "pink",
+##              key    => "p",
+##              r      => 255,
+##              g      => 157,
+##              b      => 245,
+##              fg8    => fg8(218),
+##              bg8    => bg8(138),
+##              ansifg => color("bold magenta"),
+##              ansibg => color("on_magenta"),
+##            },
+##           +{ name   => "purple-red",
+##              key    => "e",
+##              r      => 240,
+##              g      => 102,
+##              b      => 170,
+##              fg8    => fg8(162),
+##              bg8    => bg8(52),
+##              ansifg => color("bold magenta"),
+##              ansibg => color("on_magenta"),
+##            },
+##           +{ name   => "brown",
+##              key    => "n",
+##              r      => 219,
+##              g      => 161,
+##              b      => 57,
+##              fg8    => fg8(178),
+##              bg8    => bg8(95),
+##              ansifg => color("bold magenta"),
+##              ansibg => color("on_magenta"),
+##            },
+##         );
+## }
+## 
+## sub clr {
+##   my ($cname, $bg) = @_;
+##   return "" if $opt{colordepth} < 4;
+##   return "" if not $cname;
+##   my ($cdef) = grep { $$_{name} eq $cname } @clrdef;
+##   die "No such color: $cname" if not ref $cdef;
+##   if ($opt{colordepth} >= 24) {
+##     if ($bg) {
+##       return rgb(int($$cdef{r} / 3), int($$cdef{g} / 3), int($$cdef{b} / 3), $bg);
+##     } else {
+##       return rgb($$cdef{r}, $$cdef{g}, $$cdef{b});
+##     }
+##   } elsif ($opt{colordepth} >= 8) {
+##     if ($bg) {
+##       return $$cdef{ansibg} . $$cdef{bg8};
+##     } else {
+##       return $$cdef{ansifg} . $$cdef{fg8};
+##     }
+##   } elsif ($bg) {
+##     return $$cdef{ansibg};
+##   } else {
+##     return $$cdef{ansifg};
+##   }
+## }
+##
+## sub gotoxy {
+##   my ($x, $y) = @_;
+##   return "\033[${y};${x}H";
+## }
 
 #################################################################################################
 #################################################################################################
@@ -3427,10 +2643,11 @@ sub gotoxy {
 sub debuglog {
   my ($msg) = @_;
   if ($opt{debug}) {
-    open DEBUG, ">>", "debug.log";
-    my $now = DateTime->now( time_zone => $opt{localtimezone} );
-    print DEBUG $msg . "\n";
-    close DEBUG;
+    #open DEBUG, ">>", "debug.log";
+    #my $now = DateTime->now( time_zone => $opt{localtimezone} );
+    #print DEBUG $msg . "\n";
+    #close DEBUG;
+    egggamelog($msg);
   }
 }
 
