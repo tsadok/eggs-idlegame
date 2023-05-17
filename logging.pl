@@ -5,7 +5,8 @@ use strict;
 use DateTime;
 use DateTime::HiRes;
 
-our $timezone; require "./timezone.pl";
+our ($timezone, %option);
+require "./timezone.pl";
 $timezone ||= "UTC";
 
 our ($datadir, $logdir,
@@ -19,6 +20,7 @@ sub sendtologfiles {
   # Only call this directly, when sending to more than one logfile.
   # That way less will have to change if we later need to complicate
   # its argument list for any reason.
+  return if not $option{debug};
   my ($info, @logfile) = @_;
   my $now = DateTime->now(time_zone => $timezone);
   for my $lf (unique(@logfile)) {

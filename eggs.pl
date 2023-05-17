@@ -14,8 +14,13 @@ use File::Spec::Functions qw(catfile);
 use File::HomeDir;
 use Math::Tau;
 use Carp;
+#use Profile::Log;
 
-our (%option, $egggamelogfile, $widgetlogfile, $colorlogfile);
+our $reset = chr(27) . qq{[0m};
+our ($screen, $xmax, $ymax);
+our ($wfocus, $wcount, @widget, %bigtextfont, @namedcolor);
+our (%option, $egggamelogfile, $widgetlogfile, $colorlogfile, $screenlogfile);
+
 require "./paths.pl";
 require "./logging.pl";
 require "./widgets.pl";
@@ -31,9 +36,8 @@ binmode(STDOUT, ":utf8");
 #################################################################################################
 #################################################################################################
 
-my @clrdef = named_colors(); # Needed here because certain options base their enums on it.
 my @clropt = map {  +{ key => $$_{key}, value => $$_{name}, name => $$_{name}, },
-                  } grep { $$_{key} } @clrdef;
+                  } grep { $$_{key} } @namedcolor;
 my @option = ( +{ short    => "-",
                   default  => undef,
                   true     => "true",
@@ -271,13 +275,10 @@ my @cmda = @ARGV; while (scalar @cmda) {
 #################################################################################################
 #################################################################################################
 
-my $reset = chr(27) . qq{[0m};
-my ($screen, $xmax, $ymax, $wcount, $buyitem, $setting, $budgetitem, $debughint);
 my ($wbg, $wtopbar, $wcashflow, $wmessages, $wassets, $wbudget, $wbuy, $wsettings,
-    $wgameclock, $wrealclock,
-    $wordkey, $wfocus, @widget);
+    $wgameclock, $wrealclock, $wordkey);
+my ($buyitem, $setting, $budgetitem, $debughint);
 my ($breedlvl, $genlvl, $genleak) = (1, 1, 1);
-
 my (@message, @messageline);
 my @relative = (["favourite uncle",  "he",  "his"],
                 ["sainted aunt",     "she", "her"],
@@ -293,13 +294,14 @@ my @relative = (["favourite uncle",  "he",  "his"],
                );
 #use Data::Dumper; print Dumper(+{ relative => \@relative }); exit 0;
 
-for my $lf ($widgetlogfile, $colorlogfile, $egggamelogfile) {
-  my $msg = qq[*************** Starting Egg Game $version ($0) [$$] ***************];
-  if ($opt{clearlogs}) {
-    overwritelogfile($lf, $msg);
-  } else {
-    sendtologfile($lf, $msg);
-  }}
+if ($opt{debug}) {
+  for my $lf ($widgetlogfile, $colorlogfile, $egggamelogfile) {
+    my $msg = qq[*************** Starting Egg Game $version ($0) [$$] ***************];
+    if ($opt{clearlogs}) {
+      overwritelogfile($lf, $msg);
+    } else {
+      sendtologfile($lf, $msg);
+    }}}
 
 my %cashflow;
 my %globalkeybinding = global_key_bindings();
@@ -318,7 +320,7 @@ END { ReadMode 0; };
 ReadMode 3;
 $|=1;
 
-debuglog("Started game session " . $now->ymd() . " at " . $now->hms());
+debuglog("Started game session " . $now->ymd() . " at " . $now->hms()) if $option{debug};
 
 %buyqtty = ( 1 => +{ id     => 1,
                      key    => "o",
@@ -741,6 +743,7 @@ refreshscreen();
 
 while (1) {
   iterate() unless $paused; # Do the egg-game-specific once-per-turn things.
+
   for my $w (@widget) {
     if (not $$w{__INTERVAL_POS__}) {
       dowidget($w, $screen);
@@ -752,6 +755,7 @@ while (1) {
   }
   updatetopbar($wtopbar);
   draweggscreen($screen);
+
   my $delay = $opt{delay} || 1;
   while ($delay > 0) {
     my $since = [gettimeofday()];
@@ -1618,6 +1622,9 @@ sub global_key_bindings {
           chr(18) => sub { # Ctrl-R:
             redraw(@_);
           },
+          chr(24) => sub { # Ctrl-X
+            print "\nExiting game at user request.\n"; exit 0;
+          },
           "?" => sub {
             dohelp($wfocus);
           },
@@ -1790,21 +1797,6 @@ sub input_settings {
   }
 }
 
-sub input_ordkey {
-  my ($w, $k) = @_;
-  my $n = 1;
-  while ($$w{"line" . $n}) { $n++; }
-  $$w{"line" . $n} = ord $k;
-  # If we hit the bottom of the available space, scroll:
-  while ($n + 2 > ($$w{ymax} - $$w{y})) {
-    for my $p (1 .. $n) {
-      $$w{"line" . $p} = $$w{"line" . ($p + 1)} || undef;
-    }
-    $n--;
-  }
-  draweggscreen($screen);
-}
-
 #################################################################################################
 #################################################################################################
 ###
@@ -1827,16 +1819,17 @@ sub doeggwidget {
   my $bg  = (($$w{id} eq $$wfocus{id}) ? $hbg : undef) ||
     ($$w{transparent} ? '__TRANSPARENT__' : $$w{bg}) ||
     '__TRANSPARENT__';
-  debuglog("Drawing widget $$w{id} ($$w{type}/$$w{subtype}, $$w{fg}/$$w{focusbg}, $$w{transparent}) on a $bg background.");
+  debuglog("Drawing widget $$w{id} ($$w{type}/$$w{subtype}), fg=$$w{fg}/$$w{focusbg}, bg=$$w{bg}, xp=$$w{transparent}, on a $bg background.");
   debuglog("Geometry: ($$w{x},$$w{y}) / ($$w{xmax},$$w{ymax})");
-  #if ($$w{redraw} or $bg) {
-  blankrect($s, $$w{x}, $$w{y}, $$w{xmax} - 1, $$w{ymax} - 1,
-            #($bg eq "__TRANSPARENT__" ? $bg : clr($bg, "bg"))
-            sub { my ($x,$y) = @_;
-                  return widgetbg($w, undef, $$s[$x][$y]);
-                }, " ", widgetfg($w));
-  doborder($w, $s);
-  #}
+  if ($$w{redraw} or ($bg and ($bg ne "__TRANSPARENT__"))) {
+    blankrect($s, $$w{x}, $$w{y}, $$w{xmax}, $$w{ymax},
+              sub { my ($x,$y) = @_;
+                    my $stbg = $option{$$w{subtype} . "bg"};
+                    colorlog("sub [that doeggwidget passed to blankrect]: asking widgetbg for '$stbg', passing old=" . Dumper($$s[$x][$y]));
+                    return widgetbg($w, $stbg, $$s[$x][$y]);
+                  }, " ", widgetfg($w));
+    doborder($w, $s, @more);
+  }
   my $n = 0;
   for my $i (windowitems($w)) {
     $n++;
@@ -1846,7 +1839,7 @@ sub doeggwidget {
                   text        => $$i{key},
                   x           => $$w{x} + 1,
                   y           => $$w{y} + $n,
-                  bg          => $$w{bg},
+                  bg          => $bg,
                   fg          => $$i{hilight} || $$i{fg} || $$w{hilight} || $$w{fg},
                   transparent => $$w{transparent},
                 }, $s);
@@ -1855,12 +1848,12 @@ sub doeggwidget {
                . ($$w{x} + 1 + ($$i{key} ? 2 : 0))
                . ","
                . ($$w{y} + $n)
-               . qq[), ] . ($$i{fg} || $$w{fg}) . " on $$w{bg}");
+               . qq[), ] . ($$i{fg} || $$w{fg}) . " on $bg" . ($$w{transparent} ? ", xparent" : ""));
       dotext(+{ id          => $$w{id} . "_label_" . $n,
                 text        => substr($$i{name}, 0, $$w{xmax} -$$w{x} - 2),
                 x           => $$w{x} + 1 + ($$i{key} ? 2 : 0),
                 y           => $$w{y} + $n,
-                bg          => $$w{bg},
+                bg          => $bg,
                 fg          => $$i{fg} || $$w{fg},
                 transparent => $$w{transparent},
               }, $s);
@@ -1871,7 +1864,7 @@ sub doeggwidget {
                 text        => " " . substr($$i{value}, 0, $$w{xmax} - $$w{x} - 3),
                 x           => $$w{xmax} - length($$i{value}) - 2,
                 y           => $$w{y} + $n,
-                bg          => $$w{bg},
+                bg          => $bg,
                 fg          => $$i{fg} || $$w{fg},
                 transparent => $$w{transparent},
               }, $s)
@@ -2195,7 +2188,7 @@ sub refreshscreen {
                 [ map {
                   +{ char => "▒",
                      fg   => "grey",
-                     bg   => "grey",
+                     bg   => "black",
                    };
                 } 0 .. $ymax ]
               } 0 .. $xmax ];
@@ -2205,16 +2198,20 @@ sub layout {
   ($xmax, $ymax) = Term::Size::chars *STDOUT{IO};
   $xmax ||= 80;
   $ymax ||= 24;
-  $xmax--; $ymax--; # Term::Size::chars returns counts, not zero-indexed maxima.
+  #$xmax--; $ymax--; # Term::Size::chars returns counts, not zero-indexed maxima.  Sometimes.  It's complicated, and confusing, and might depend on the terminal.
   $xmax = $opt{xmax} if $opt{xmax} and ($xmax > $opt{xmax});
   $ymax = $opt{ymax} if $opt{ymax} and ($ymax > $opt{ymax});
   my $leftsize  = ($xmax > 100) ? int($xmax / 5) : 20;
   my $rightsize = ($xmax > 100) ? int($xmax / 5) : 20;
   my $msgheight = int($ymax / 2); # TODO: maybe adjust this.
   my $budgetheight = 12;
-  $wbg = +{ x => 0, y => 0, xmax => $xmax + 1, ymax => $ymax + 1,
-            type => "diffuse",
-            redraw => 1, };
+  $wbg = +{ x => 1, y => 1, xmax => $xmax + 1, ymax => $ymax + 1,
+            type    => "diffuse",
+            fg      => "default",
+            bg      => "default",
+            id      => $wcount++,
+            preseed => 7,
+            redraw  => 1, };
   #if ($ymax > 26) {
   #  $wrealclock = +{ type => "clock",
   #                   x => 0, y => $ymax - 5,
@@ -2255,6 +2252,7 @@ sub layout {
                   text => join("", map { " " } 0 .. $xmax),
                   x => 0, y => 0, xmax => $xmax, ymax => 0,
                   bg => "brown", fg => "azure",
+                  id => $wcount++,
                   #transparent => 0,
                 };
   $wcashflow = +{ type => "egggame", subtype => "cashflow", title => "Cash Flow (F9)", mode => "",
@@ -2297,6 +2295,7 @@ sub layout {
                   input => sub { input_ordkey(@_); },
                   fg => "purple", #bg => "purple",
                   id => $wcount++,
+                  transparent => 1,
                 };
   }
   my $middlesize = $xmax - $leftsize - $rightsize - ($wordkey ? 12 : 0);
@@ -2316,6 +2315,7 @@ sub layout {
                   transparent => 1,
                 };
   $wfocus ||= $wbuy;
+  $$wbg{disabled} = ($opt{colordepth} >= 24) ? 0 : 1;
   @widget = grep { $_ and not $$_{disabled}
                  } ($wbg, $wtopbar, $wcashflow,
                     #$wgameclock, $wrealclock,
@@ -2333,305 +2333,6 @@ sub layout {
 ##   my $hsv = Imager::Color->new( hsv =>  [ $$c{h}, ($$c{v} / 100), ($$c{s} / 100) ] ); # hue, val, sat
 ##   ($$c{r}, $$c{g}, $$c{b}) = $hsv->rgba;
 ##   return $c;
-## }
-## 
-## sub rgb { # Return terminal code for a 24-bit color.
-##   my ($red, $green, $blue, $isbg) = @_;
-##   push @message, ["rgb() called at inappropriate color depth.", "bug"]
-##     if $opt{colordepth} < 24;
-##   my $fgbg = ($isbg) ? 48 : 38;
-##   my $delimiter = ";";
-##   return "\x1b[$fgbg$ {delimiter}2$ {delimiter}$ {red}"
-##     . "$ {delimiter}$ {green}$ {delimiter}$ {blue}m";
-## }
-## 
-## sub bg8 {
-##   my ($cnum) = @_;
-##   return eightbitcolorcode($cnum, "bg");
-## }
-## sub fg8 {
-##   my ($cnum) = @_;
-##   return eightbitcolorcode($cnum);
-## }
-## sub eightbitcolorcode {
-##   my ($cnum, $isbg) = @_;
-##   my $fgbg = $isbg ? 48 : 38;
-##   return chr(27) . qq([$fgbg;5;${cnum}m);
-## }
-## 
-## sub color_test {
-##   push @message, ["Color Test: ", "meta"];
-##   for my $fg (@clrdef) {
-##     push @message, [$$fg{name}, $$fg{name}];
-##     # TODO: and show that on various backgrounds.
-##   }
-## }
-## 
-## sub colordefs {
-##   # Alphabetical list of keys:
-##   # c - cyan
-##   # d - gold
-##   # e - purple-red
-##   # g - green
-##   # h - hot pink
-##   # i - indigo
-##   # k - black
-##   # l - blue
-##   # m - magenta
-##   # n - brown
-##   # o - orange
-##   # p - pink
-##   # q - red-orange
-##   # r - red
-##   # s - grey (mnemonic: silver)
-##   # t - teal
-##   # u - purple
-##   # v - various (widget-defined)
-##   # w - white
-##   # x - spring green
-##   # y - yellow
-##   # z - azure
-##   return (+{ name => "white",
-##              key    => "w",
-##              r      => 250,
-##              g      => 250,
-##              b      => 250,
-##              fg8    => fg8(255),
-##              bg8    => bg8(243),
-##              ansifg => color("bold white"),
-##              ansibg => color("on_white"),
-##            },
-##           +{ name   => "grey",
-##              key    => "s",
-##              r      => 200,
-##              g      => 200,
-##              b      => 200,
-##              fg8    => fg8(251),
-##              bg8    => bg8(240),
-##              ansifg => color("white"),
-##              ansibg => color("on_white"),
-##            },
-##           +{ name   => "black",
-##              key    => "k",
-##              r      => 128,
-##              g      => 128,
-##              b      => 128,
-##              fg8    => fg8(243),
-##              bg8    => bg8(232),
-##              ansifg => color("bold black"),
-##              ansibg => color("on_black"),
-##            },
-##           +{ name => "red",
-##              key    => "r",
-##              r      => 200,
-##              g      => 0,
-##              b      => 0,
-##              fg8    => fg8(160),
-##              bg8    => bg8(88),
-##              ansifg => color("bold red"),
-##              ansibg => color("on_red"),
-##            },
-##           +{ name   => "red-orange",
-##              key    => "q",
-##              r      => 255,
-##              g      => 100,
-##              b      => 0,
-##              fg8    => fg8(202),
-##              bg8    => bg8(88),
-##              ansifg => color("bold red"),
-##              ansibg => color("on_red"),
-##            },
-##           +{ name   => "orange",
-##              key    => "o",
-##              r      => 255,
-##              g      => 126,
-##              b      => 0,
-##              fg8    => fg8(208),
-##              bg8    => bg8(130),
-##              ansifg => color("bold red"),
-##              ansibg => color("on_red"),
-##            },
-##           +{ name   => "gold",
-##              key    => "d",
-##              r      => 255,
-##              g      => 176,
-##              b      => 0,
-##              fg8    => fg8(214),
-##              bg8    => bg8(94),
-##              ansifg => color("bold yellow"),
-##              ansibg => color("on_yellow"),
-##            },
-##           +{ name   => "yellow",
-##              key    => "y",
-##              r      => 255,
-##              g      => 255,
-##              b      => 0,
-##              fg8    => fg8(11),
-##              bg8    => bg8(94),
-##              ansifg => color("bold yellow"),
-##              ansibg => color("on_yellow"),
-##            },
-##           +{ name   => "spring green",
-##              key    => "x",
-##              r      => 214,
-##              g      => 255,
-##              b      => 0,
-##              fg8    => fg8(190),
-##              bg8    => bg8(100),
-##              ansifg => color("bold yellow"),
-##              ansibg => color("on_yellow"),
-##            },
-##           +{ name   => "green",
-##              key    => "g",
-##              r      => 0,
-##              g      => 255,
-##              b      => 0,
-##              fg8    => fg8(46),
-##              bg8    => bg8(22),# or 28?
-##              ansifg => color("bold green"),
-##              ansibg => color("on_green"),
-##            },
-##           +{ name   => "teal",
-##              key    => "t",
-##              r      => 50,
-##              g      => 240,
-##              b      => 153,
-##              fg8    => fg8(158),
-##              bg8    => bg8(22),# or 29?
-##              ansifg => color("bold cyan"),
-##              ansibg => color("on_cyan"),
-##            },
-##           +{ name   => "cyan",
-##              key    => "c",
-##              r      => 0,
-##              g      => 255,
-##              b      => 255,
-##              fg8    => fg8(44),
-##              bg8    => bg8(30),
-##              ansifg => color("bold cyan"),
-##              ansibg => color("on_cyan"),
-##            },
-##           +{ name   => "azure",
-##              key    => "z",
-##              r      => 96,
-##              g      => 210,
-##              b      => 255,
-##              fg8    => fg8(45),
-##              bg8    => bg8(31),
-##              ansifg => color("bold cyan"),
-##              ansibg => color("on_blue"),
-##            },
-##           +{ name   => "blue",
-##              key    => "l",
-##              r      => 100,
-##              g      => 100,
-##              b      => 255,
-##              fg8    => fg8(21),
-##              bg8    => bg8(18),
-##              ansifg => color("bold blue"),
-##              ansibg => color("on_blue"),
-##            },
-##           +{ name   => "indigo",
-##              key    => "i",
-##              r      => 143,
-##              g      => 96,
-##              b      => 255,
-##              fg8    => fg8(147),
-##              bg8    => bg8(17), # or 54
-##              ansifg => color("bold blue"),
-##              ansibg => color("on_blue"),
-##            },
-##           +{ name   => "purple",
-##              key    => "u",
-##              r      => 181,
-##              g      => 0,
-##              b      => 236,
-##              fg8    => fg8(177),
-##              bg8    => bg8(53),
-##              ansifg => color("bold magenta"),
-##              ansibg => color("on_magenta"),
-##            },
-##           +{ name   => "magenta",
-##              key    => "m",
-##              r      => 255,
-##              g      => 0,
-##              b      => 255,
-##              fg8    => fg8(201),
-##              bg8    => bg8(53),
-##              ansifg => color("bold magenta"),
-##              ansibg => color("on_magenta"),
-##            },
-##           +{ name   => "hot pink",
-##              key    => "h",
-##              r      => 255,
-##              g      => 0,
-##              b      => 236,
-##              fg8    => fg8(199),
-##              bg8    => bg8(89),
-##              ansifg => color("bold magenta"),
-##              ansibg => color("on_magenta"),
-##            },
-##           +{ name   => "pink",
-##              key    => "p",
-##              r      => 255,
-##              g      => 157,
-##              b      => 245,
-##              fg8    => fg8(218),
-##              bg8    => bg8(138),
-##              ansifg => color("bold magenta"),
-##              ansibg => color("on_magenta"),
-##            },
-##           +{ name   => "purple-red",
-##              key    => "e",
-##              r      => 240,
-##              g      => 102,
-##              b      => 170,
-##              fg8    => fg8(162),
-##              bg8    => bg8(52),
-##              ansifg => color("bold magenta"),
-##              ansibg => color("on_magenta"),
-##            },
-##           +{ name   => "brown",
-##              key    => "n",
-##              r      => 219,
-##              g      => 161,
-##              b      => 57,
-##              fg8    => fg8(178),
-##              bg8    => bg8(95),
-##              ansifg => color("bold magenta"),
-##              ansibg => color("on_magenta"),
-##            },
-##         );
-## }
-## 
-## sub clr {
-##   my ($cname, $bg) = @_;
-##   return "" if $opt{colordepth} < 4;
-##   return "" if not $cname;
-##   my ($cdef) = grep { $$_{name} eq $cname } @clrdef;
-##   die "No such color: $cname" if not ref $cdef;
-##   if ($opt{colordepth} >= 24) {
-##     if ($bg) {
-##       return rgb(int($$cdef{r} / 3), int($$cdef{g} / 3), int($$cdef{b} / 3), $bg);
-##     } else {
-##       return rgb($$cdef{r}, $$cdef{g}, $$cdef{b});
-##     }
-##   } elsif ($opt{colordepth} >= 8) {
-##     if ($bg) {
-##       return $$cdef{ansibg} . $$cdef{bg8};
-##     } else {
-##       return $$cdef{ansifg} . $$cdef{fg8};
-##     }
-##   } elsif ($bg) {
-##     return $$cdef{ansibg};
-##   } else {
-##     return $$cdef{ansifg};
-##   }
-## }
-##
-## sub gotoxy {
-##   my ($x, $y) = @_;
-##   return "\033[${y};${x}H";
 ## }
 
 #################################################################################################
@@ -2702,19 +2403,22 @@ sub shownum {
       $exp++;
       $base = int($base + 4.999) / 10;
     }
-    return $base . "e+0" . $exp;
+    return $base . "e+0" . $exp; # scientific notation
+  } elsif ($n > 20 * 1000 * 1000 * 1000 * 1000 * 1000) {
+    my $q = int(($n + 500 * 1000 * 1000 * 1000 * 1000) / (1000 * 1000 * 1000 * 1000 * 1000));
+    return $q . "q"; # quadrillion
   } elsif ($n > 20 * 1000 * 1000 * 1000 * 1000) {
     my $t = int(($n + 500 * 1000 * 1000 * 1000) / (1000 * 1000 * 1000 * 1000));
-    return $t . "t";
+    return $t . "t"; # trillion
   } elsif ($n > 20 * 1000 * 1000 * 1000) {
     my $b = int(($n + 500 * 1000 * 1000) / (1000 * 1000 * 1000));
-    return $b . "b";
+    return $b . "b"; # billion
   } elsif ($n > 20 * 1000 * 1000) {
     my $m = int(($n + 500000) / (1000 * 1000));
-    return $m . "m";
+    return $m . "m"; # million
   } elsif ($n > 20 * 1000) {
     my $m = int(($n + 500) / 1000);
-    return $m . "k";
+    return $m . "k"; # k=thousand
   } else {
     return $n;
   }

@@ -1,19 +1,25 @@
 #!/usr/bin/perl
 # -*- cperl -*-
 
+# TODO: standardize color handling between monitor.pl, eggs.pl, tsvdb.pl, and utm.pl
+
+use strict;
 use utf8;
 use Term::Size;
 use Carp;
 
-our (%option, %magictext);
+our (%option, %magictext, %bigtextfont, $screen);
+our (@widget, $wfocus, $wcount);
+our ($widgetlogfile, $screenlogfile, $colorlogfile);
 our @namedcolor = named_colors();
 our %namedcolor = map { $$_{name} => $_,
                         regularize($$_{name}) => $_
                       } @namedcolor;
 our $wfocus;
 our $reset = chr(27) . qq{[0m};
+
 # TODO: consider whether we need access to %state
-# TODO: standardize color handling between monitor.pl, eggs.pl, tsvdb.pl, and utm.pl
+require "./bigtextfonts.pl";
 
 our %standard_widget_handler =
   (
@@ -308,7 +314,7 @@ sub message_log_wrap_message {
   if (not $color) {
     # In some special cases, a color is specified directly (e.g., the
     # color test that is sent when the color depth setting changes).
-    my ($cdef) = grep { $$_{name} eq $channel } @clrdef;
+    my ($cdef) = grep { $$_{name} eq $channel } @namedcolor;
     $color = $$cdef{name} if ref $cdef;
     # Last resort, go with the most generic color we've got:
     $color ||= "grey";
@@ -414,7 +420,7 @@ sub donotepad {
   }
   $$w{contentsizex} ||= $$w{xmax} - $$w{x} - 2;
   $$w{contentsizey} ||= $$w{ymax} - $$w{y} - 2;
-  doborder($w,$s);
+  doborder($w, $s, %more);
   for my $n (1 .. ($$w{ymax} - $$w{y} - 2)) {
     my $id = $$w{id} . "_line" . $n;
     dotext(+{ id          => $id,
@@ -427,6 +433,21 @@ sub donotepad {
               transparent => $$w{transparent},
             }, $s);
   }
+}
+
+sub input_ordkey {
+  my ($w, $k) = @_;
+  my $n = 1;
+  while ($$w{"line" . $n}) { $n++; }
+  $$w{"line" . $n} = ord $k;
+  # If we hit the bottom of the available space, scroll:
+  while ($n + 2 > ($$w{ymax} - $$w{y})) {
+    for my $p (1 .. $n) {
+      $$w{"line" . $p} = $$w{"line" . ($p + 1)} || undef;
+    }
+    $n--;
+  }
+  #draweggscreen($screen, %option);
 }
 
 sub doordkey {
@@ -481,7 +502,7 @@ sub doclock {
               sub { my ($x,$y) = @_;
                     ($$w{transparent}
                      ? "__TRANSPARENT__"
-                     : widgetbg($w, "bg", $$s[$x][$y]{bg},
+                     : widgetbg($w, "bg", $$s[$x][$y],
                                 # TODO
                                )) },
               " ", #"░",
@@ -533,24 +554,27 @@ sub doclock {
 }
 
 sub blankrect {
-  my ($s, $minx, $miny, $maxx, $maxy, $bg, $c, $fg) = @_;
-  croak "blankrect(): called with invalid bg, " . Dumper(+{ minx => $minx, miny => $miny, maxx => $maxx, maxy => $maxy })
-    if not $bg;
+  my ($s, $minx, $miny, $maxx, $maxy, $bgspec, $c, $fgspec) = @_;
+  #croak "blankrect(): called with invalid bg, " . Dumper(+{ minx => $minx, miny => $miny, maxx => $maxx, maxy => $maxy })
+  #  if not $bgspec;
   for my $x ($minx .. $maxx) {
     for my $y ($miny .. $maxy) {
+      my $fg = $fgspec;
+      my $bg = $bgspec;
       if ("CODE" eq ref $bg) {
         $bg = $bg->($x,$y);
-        croak "blankrect(): coderef returned invalid bg"
-          if not $bg;
+        #croak "blankrect(): coderef returned invalid bg"
+        #  if not $bg;
+        colorlog("blankrect: bg[$x][$y]=$bg");
       }
       if ("CODE" eq ref $fg) {
         $fg = $fg->($x,$y);
       }
       if ($bg eq "__TRANSPARENT__") {
         $bg = $$s[$x][$y]{bg};
-        croak "blankrect(): transparent blanking with nothing behind.  "
-          . Dumper(+{ x => $x, y => $y, cell => $$s[$x][$y] })
-          if not $bg;
+        #croak "blankrect(): transparent blanking with nothing behind.  "
+        #  . Dumper(+{ x => $x, y => $y, cell => $$s[$x][$y] })
+        #  if not $bg;
       }
       $$s[$x][$y] = +{ bg   => $bg,
                        fg   => $fg || $option{fg} || "magenta",
@@ -602,7 +626,7 @@ sub dotext {
     for my $c (split //, $text) {
       if ($x < $xmax) {
         $c = " " if $c =~ /\s/;
-        $$s[$x][$$t{y}] = +{ bg   => widgetbg($t, "bg", $$s[$x][$$t{y}]),
+        $$s[$x][$$t{y}] = +{ bg   => widgetbg($t, undef, $$s[$x][$$t{y}]),
                              fg   => widgetfg($t),
                              char => $c };
         $x++;
@@ -653,14 +677,24 @@ sub diffuse_draw {
     for my $x (0 .. $$w{xmax}) {
       my $mx = $x + $$w{offset};
       my $my = $y + $$w{offset};
-      $$s[$$w{x} + $x][$$w{y} + $y] = $eightbit
-        # TODO: This hits perf kinda hard and also doesn't work; clearly it is wrong.  Plsfix.
-        ? $namedcolor[int(diffuse_scale($$w{map}[$mx][$my]{r}) * (scalar @namedcolor) / 255)]{name}
-        : +{ bg => [diffuse_scale($$w{map}[$mx][$my]{r}),
-                    diffuse_scale($$w{map}[$mx][$my]{g}),
-                    diffuse_scale($$w{map}[$mx][$my]{b})],
-             fg   => $option{diffusefg} || $$w{diffusefg} || "black",
-             char => $option{diffusechar} || $$w{char} || "░", };
+      my $r = diffuse_scale($$w{map}[$mx][$my]{r});
+      my $g = diffuse_scale($$w{map}[$mx][$my]{g});
+      my $b = diffuse_scale($$w{map}[$mx][$my]{b});
+      my $colorname = "diffuse($r,$g,$b)";
+      $namedcolor{$colorname} ||= +{ name => $colorname,
+                                     bg   => +{ 4  => "__TRANSPARENT__",
+                                                8  => "__TRANSPARENT__", # TODO: hsv-based closest match?
+                                                24 => +{ r => $r,
+                                                         g => $g,
+                                                         b => $b,
+                                                       }},
+                                     fg   => +{ 4  => "__default__",
+                                                8  => "__default__",
+                                                24 => "__default__",
+                                              }};
+      $$s[$$w{x} + $x][$$w{y} + $y] = +{ bg   => $colorname,
+                                         fg   => $option{diffusefg} || $$w{diffusefg} || "black",
+                                         char => $option{diffusechar} || $$w{char} || "░", };
     }}
 }
 
@@ -715,9 +749,9 @@ sub diffuse_scale {
   my ($v) = @_;
   return 0 if $v <= 0;
   my $ln = log($v * 1000);
-  my $sqr = $ln * $ln;
-  if ($sqr > 255) {
-    return 255;
+  my $sqr = $ln * $ln / 2;
+  if ($sqr > 127) {
+    return 127;
   } else {
     return int $sqr;
   }
@@ -729,7 +763,7 @@ sub widgetfg {
   return "default" if $option{colordepth} < 3;
   $fgfield ||= "fg"; $fgfield = "fg" if not $$w{$fgfield};
   colorlog("widgetfg($$w{id}, '$fgfield'): "
-           . ("ARRAY" eq ref $$w{$fgfield}) ? "<" . @{$$w{$fgfield}} . ">" : $$w{$fgfield});
+           . (("ARRAY" eq ref $$w{$fgfield}) ? "<" . @{$$w{$fgfield}} . ">" : $$w{$fgfield}));
   # Debugging only.  Comment out for backward-compatibility with old monitor.cfg files:
   ## my $depth = $option{colordepth} || 8;
   ## croak "widgetfg: color depth $depth not supported.  " . Dumper(+{ w => $w, fgfield => $fgfield })
@@ -739,30 +773,35 @@ sub widgetfg {
 
 sub widgetbg {
   my ($w, $bgfield, $old) = @_;
-  croak "widgetbg(): no third argument" if not defined $old;
+  #croak "widgetbg(): no third argument" if not defined $old;
   #croak(Dumper(+{ option => \%option })) if not $option{colordepth};
+  $old ||= +{ char => "E", fg => 'yellow', bg => 'red' };
   return "default" if $option{colordepth} < 3;
   $bgfield ||= ($$w{id} eq $$wfocus{id}) ? "focusbg" : "bg";
   $bgfield = "bg" if not $$w{$bgfield};
-  if ($$w{transparent} and ($$w{id} ne ((ref $wfocus) ? ($$wfocus{id} || "__DO_NOT_MATCH__") : "__NO_MATCH__"))) {
+  if ($$w{transparent}
+      and ($$w{id} ne ((ref $wfocus) ? ($$wfocus{id} || "__DO_NOT_MATCH__") : "__NO_MATCH__"))) {
+    #croak "widgetbg(): improper old cell: $old  " . Dumper(+{ screen => $screen }) . "\nrepeat, widgetbg(): improper old cell: $old  "
+    #  if $old and not ref $old;
     if ($$old{bg}) {
-      colorlog("widgetbg($$w{id}, '$bgfield'): Transparent widget, keeping bg, " . ($$old{bg} || "bg"));
+      colorlog("widgetbg($$w{id}, '$bgfield'): Transparent widget, keeping bg, "
+               . (("ARRAY" eq ref $$old{bg}) ? ("[" . (join ",", @{$$old{bg}}) . "]") : $$old{bg} || "bg"));
       return $$old{bg};
     } else {
-      croak "widgetbg($$w{id}, '$bgfield', " . Dumper($old) . "): Transparent widget with nothing behind it.";
+      # croak "widgetbg($$w{id}, '$bgfield', " . Dumper($old) . "): Transparent widget with nothing behind it.";
       colorlog("widgetbg($$w{id}, '$bgfield', $old): Transparent widget with nothing behind it.");
       return "magenta";
     }
   }
   colorlog("widgetbg($$w{id}, '$bgfield'): "
-           . ("ARRAY" eq ref $$w{$bgfield}) ? "<" . @{$$w{$bgfield}} . ">" : $$w{$bgfield});
+           . (("ARRAY" eq ref $$w{$bgfield}) ? "<" . @{$$w{$bgfield}} . ">" : $$w{$bgfield}));
   # Debugging only.  For backward compatibility with old monitor.cfg
   # that specifies colors as rgb-triplets, comment out the next three
   # lines:
-  ## my $depth = $option{colordepth} || 8;
-  ## croak "widgetbg: color depth $depth not supported.  " . Dumper(+{ w => $w, bgfield => $bgfield })
-  ##   if ((ref $$w{$bgfield}) and not (("HASH" eq ref $$w{$bgfield}) and $$w{$bgfield}{$depth}));
-  return $$w{$bgfield} || $option{bg} || "black";
+  ##my $depth = $option{colordepth} || 8;
+  ##croak "widgetbg: color depth $depth not supported.  " . Dumper(+{ w => $w, bgfield => $bgfield })
+  ##  if ((ref $$w{$bgfield}) and not (("HASH" eq ref $$w{$bgfield}) and $$w{$bgfield}{$depth}));
+  return $$w{$bgfield}  || $$w{bg} || $option{bg} || "black";
 }
 
 sub drawscreen {
@@ -810,7 +849,7 @@ sub drawscreen {
                               y      => $y,
                               ymax   => $arg{ymax},
                               fr     => $arg{fullrect},
-                            }));
+                            })) if $arg{debug};
       print ""
         . ((($$s[$x][$y]{bg} eq $lastbg) and
             ($$s[$x][$y]{fg} eq $lastfg))
