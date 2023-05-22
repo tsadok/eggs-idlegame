@@ -5,6 +5,7 @@ use strict;
 use utf8;
 use open ':encoding(UTF-8)';
 use open ":std";
+#use bignum;
 use DateTime;
 use Term::Size;
 use Term::ReadKey;
@@ -25,7 +26,7 @@ require "./paths.pl";
 require "./logging.pl";
 require "./widgets.pl";
 
-my $version = "0.2 alpha";
+my $version = "0.3.0 alpha";
 binmode(STDOUT, ":utf8");
 
 #################################################################################################
@@ -82,10 +83,11 @@ my @option = ( +{ short    => "-",
                   desc    => "Bit depth for terminal colors.",
                   key     => "c",
                   save    => "user",
-                  enum    => [+{key => "a", value =>  4, name => "ANSI"},
-                              +{key => "b", value =>  1, name => "Mono/bw"},
-                              +{key => "c", value =>  8, name => "256-color"},
-                              +{key => "d", value => 24, name => "TrueColor"},],
+                  enum    => [+{key => "m", value =>  1, name => "Mono/bw"},
+                              +{key => "3", value =>  3, name => "Basic ANSI"},
+                              +{key => "4", value =>  4, name => "Full ANSI"},
+                              +{key => "8", value =>  8, name => "256-color"},
+                              +{key => "t", value => 24, name => "TrueColor"},],
                 },
                +{ name    => "focusbgcolor",
                   default => "blue",
@@ -168,9 +170,20 @@ my @option = ( +{ short    => "-",
                   true    => 1,
                   save    => "none",
                 },
+               #+{ name    => "writepricelist",
+               #   default => 0,
+               #   true    => 1,
+               #   save    => "none",
+               # },
                +{ name    => "channelcolor_story",
                   desc    => "Color for messages about the game's over-arching story and your character's life.",
                   default => "white",
+                  save    => "user",
+                  enum    => [ @clropt ],
+                },
+               +{ name    => "channelcolor_occasion",
+                  desc    => "Color for messages about events that occur in the game's world.",
+                  default => "yellow",
                   save    => "user",
                   enum    => [ @clropt ],
                 },
@@ -223,20 +236,20 @@ my @option = ( +{ short    => "-",
                   enum    => [ @clropt ],
                 },
              );
-my %opt = map { $$_{name} => $$_{default} } @option;
-loadoptions(\%opt);
-%option = %opt; # for widgets.pl use
+%option = map { $$_{name} => $$_{default} } @option;
+loadoptions(\%option);
+debuglog("options: " . Dumper(\%option));
 
 my @cmda = @ARGV; while (scalar @cmda) {
   my $x = shift @cmda;
   my $prevopt = undef;
-  if (($x eq "--") and not $opt{disable_shortops}) {
-    $opt{disable_shortops} = "true";
-  } elsif ($x =~ /^-(\w+)$/ and not $opt{disable_shortops}) {
+  if (($x eq "--") and not $option{disable_shortops}) {
+    $option{disable_shortops} = "true";
+  } elsif ($x =~ /^-(\w+)$/ and not $option{disable_shortops}) {
     for my $f (split //, $1) {
       my ($o) = grep { $$_{short} eq $f } @option;
       if ($o) {
-        $opt{$$o{name}} = $opt{$$o{true}};
+        $option{$$o{name}} = $option{$$o{true}};
         $prevopt = $$o{name};
       } else {
         die "Unrecognized command-line option, -$f";
@@ -245,7 +258,7 @@ my @cmda = @ARGV; while (scalar @cmda) {
     my ($n, $v) = ($1, $2);
     my ($o) = grep { $$_{name} eq $n } @option;
     if ($o) {
-      $opt{$$o{name}} = $v;
+      $option{$$o{name}} = $v;
       $prevopt = undef;
     } else {
       die "Unrecognized command-line option, --$n";
@@ -254,13 +267,13 @@ my @cmda = @ARGV; while (scalar @cmda) {
     my ($n) = ($1);
     my ($o) = grep { $$_{name} eq $n } @option;
     if ($o) {
-      $opt{$$o{name}} = $$o{true};
+      $option{$$o{name}} = $$o{true};
       $prevopt = $$o{name};
     } else {
       die "Unrecognized command-line option, --$n";
     }
   } elsif ($prevopt) {
-    $opt{$prevopt} = $x;
+    $option{$prevopt} = $x;
     $prevopt = undef;
   } else {
     die "Did not understand command-line option: $x";
@@ -278,8 +291,8 @@ my @cmda = @ARGV; while (scalar @cmda) {
 my ($wbg, $wtopbar, $wcashflow, $wmessages, $wassets, $wbudget, $wbuy, $wsettings,
     $wgameclock, $wrealclock, $wordkey);
 my ($buyitem, $setting, $budgetitem, $debughint);
-my ($breedlvl, $genlvl, $genleak) = (1, 1, 1);
-my (@message, @messageline);
+my ($breedlvl, $genlvl, $genleak, $gamephase) = (1, 1, 1, 1);
+my (@message, @messageline, @county, @extantplace);
 my @relative = (["favourite uncle",  "he",  "his"],
                 ["sainted aunt",     "she", "her"],
                 ["grandfather",      "he",  "his"],
@@ -294,10 +307,10 @@ my @relative = (["favourite uncle",  "he",  "his"],
                );
 #use Data::Dumper; print Dumper(+{ relative => \@relative }); exit 0;
 
-if ($opt{debug}) {
+if ($option{debug}) {
   for my $lf ($widgetlogfile, $colorlogfile, $egggamelogfile) {
     my $msg = qq[*************** Starting Egg Game $version ($0) [$$] ***************];
-    if ($opt{clearlogs}) {
+    if ($option{clearlogs}) {
       overwritelogfile($lf, $msg);
     } else {
       sendtologfile($lf, $msg);
@@ -306,13 +319,13 @@ if ($opt{debug}) {
 my %cashflow;
 my %globalkeybinding = global_key_bindings();
 my $inputprefix = "";
-my $now  = DateTime->now( time_zone => $opt{localtimezone} );
+my $now  = DateTime->now( time_zone => $option{localtimezone} );
 my $date = DateTime->new( year  => 1970,
                           month => 1,
                           day   => 1,
                           hour  => 6,
                         );
-my ($cash, $runstarted, $ngpeta, $paused);
+my ($cash, $runstarted, $ngpeta, $birthdate, $paused);
 $cash = 0;
 my (%buyqtty, %budget, %asset, %windowitem);
 
@@ -358,6 +371,30 @@ debuglog("Started game session " . $now->ymd() . " at " . $now->hms()) if $optio
                        number => 100,
                        pmult  => 100,
                      },
+             1000 => +{ id     => 1000,
+                        key    => "k",
+                        name   => "thousand",
+                        number => 1000,
+                        pmult  => 1000,
+                      },
+             25000 => +{ id     => 25000,
+                         key    => "r",
+                         name   => "25k",
+                         number => 25000,
+                         pmult  => 25000,
+                       },
+             250000 => +{ id     => 250000,
+                          key    => "q",
+                          name   => "250k",
+                          number => 250000,
+                          pmult  => 250000,
+                        },
+             5000000 => +{ id     => 5000000,
+                           key    => "5",
+                           name   => "5m",
+                           number => 5000000,
+                           pmult  => 5000000,
+                         },
              144 => +{ id     => 144,
                        key    => "g",
                        name   => "gross",
@@ -376,26 +413,62 @@ debuglog("Started game session " . $now->ymd() . " at " . $now->hms()) if $optio
                          key    => "f",
                          pmult  => 10000,
                        },
+             248832 => +{ id     => 248832,
+                          number => 248832,
+                          name   => "eaurie",
+                          key    => "e",
+                          pmult  => 100000,
+                        },
+             2985984 => +{ id     => 2985984,
+                           number => 2985984,
+                           name   => "passel",
+                           key    => "p",
+                           pmult  => 1000000,
+                         },
+             35831808 => +{ id     => 35831808,
+                            number => 35831808,
+                            name   => "clutch",
+                            key    => "h",
+                            pmult  => 10000000,
+                          },
+             429981696 => +{ id     => 429981696,
+                             number => 429981696,
+                             name   => "batallion",
+                             key    => "b",
+                             pmult  => 100000000,
+                           },
+             5159780352 => +{ id     => 5159780352,
+                              number => 5159780352,
+                              name   => "army",
+                              key    => "m",
+                              pmult  => 1000000000,
+                            },
              feedbag => +{ id     => "feedbag",
                            key    => "b",
                            name   => "bag",
                            pmult  => 1, # feed prices are per-bag, of course
                            number => 150,
-                           # A 25lb bag feeds one adult chicken for 150 days.
+                           # A bag of feed feeds one adult chicken for 150 days.
                            # Chicks eat less.
                          },
              feedpallet => +{ id     => "feedpallet",
                               key    => "p",
                               name   => "pallet",
-                              pmult  => 24,
+                              pmult  => 20,
                               number => 3750,
                             },
              feedtruck => +{ id      => "feedtruck",
                              key     => "t",
                              name    => "truckload",
-                             pmult   => 240,
+                             pmult   => 180,
                              number  => 45000,
                            },
+             feedwarehouse => +{ id     => "feedwarehouse",
+                                 key    => "w",
+                                 name   => "warehouse",
+                                 pmult  => 5000,
+                                 number => 2250000,
+                               },
              asneeded_feed => +{ id         => "asneeded_feed",
                                  key        => "a",
                                  name       => "as needed",
@@ -489,6 +562,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          },
             # TODO:
             #  * Lobbyists, who promote friendly legislation to increase prices on eggs and chicken meat.
+            #  * Stocks, with auto-invest option for when cash gets large, auto-sell as needed for purchases.
           );
 %asset   =  ( egg => +{ id     => "egg",
                         name   => "egg",
@@ -545,16 +619,17 @@ my @pctopt = map { my ($pct, $key) = @$_;
                                # Holds 13000 TEU, i.e., 6500 of our 40' containers.
                                desc    => "This freighter is loaded with 6500 containers of fresh eggs.",
                                value   => 9000000000,
+                               retail  => 10108800000,
                                sort    => 6,
                                (map { $_ => 1 } qw(product egg)),
                              },
-              podload => { id     => "podload",
-                           name   => "cargo pod of eggs",
-                           plural => "cargo pods of eggs",
-                           desc   => "This cargo pod holds 1024 surface freighters of eggs fresh from Earth, a delicacy sure to arouse interest on any colony.",
-                           value  => 12000000000000,
-                           sort   => 7,
-                         },
+              podload => +{ id     => "podload",
+                            name   => "cargo pod of eggs",
+                            plural => "cargo pods of eggs",
+                            desc   => "This cargo pod holds 1024 surface freighters of eggs fresh from Earth, a delicacy sure to arouse interest on any colony.",
+                            value  => 12000000000000,
+                            sort   => 7,
+                          },
               chick => +{ id      => "chick",
                           name    => "baby chick",
                           desc    => "Baby chicks are cute.  They can grow up into hens or, sometimes, roosters.",
@@ -563,7 +638,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                           sort    => 100,
                           (map { $_ => 1 } qw(product good chicken)),
                           housein  => "nursery",
-                          buyqtty  => [qw(1 12 144 1728 20736)],
+                          buyqtty  => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352)],
                           unlocked => +{ buy => +{ 1 => 1, }, },
                           lifespan => +{ months => 7, }, # includes time to hatch;
                           # at EOL, a chick may grow up into a hen (or a rooster); this is handled by expire_asset()
@@ -578,7 +653,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                         sort         => 101,
                         (map { $_ => 1 } qw(product good chicken)),
                         housein      => "coop",
-                        buyqtty      => [qw(1 12 144)],
+                        buyqtty      => [qw(1 12 144 1728 20736 248832 35831808 429981696 5159780352)],
                         unlocked     => +{ buy => +{ 1 => 1, }, },
                         lifespan     => +{ years => 8 },
                         needvitamins => "1970-01-31",
@@ -593,7 +668,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                             sort       => 102,
                             (map { $_ => 1 } qw(product good chicken)),
                             housein    => "coop",
-                            buyqtty    => [qw(1 12 144)],
+                            buyqtty    => [qw(1 12 144 1728 20736 248832 35831808 429981696 5159780352)],
                             unlocked   => +{ buy => +{ 1 => 1, }, },
                             lifespan   => +{ years => 8 },
                           },
@@ -605,7 +680,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                                 value    => 180, # That's per bag, not per serving.
                                 sort     => 200,
                                 (map { $_ => 1 } qw(supply good)),
-                                buyqtty  => [qw(feedbag feedpallet feedtruck asneeded_feed)],
+                                buyqtty  => [qw(feedbag feedpallet feedtruck feedwarehouse asneeded_feed)],
                                 unlocked => +{ buy => +{ feedbag => 1, }, },
                               },
               vitamins => +{ id         => "vitamins",
@@ -616,13 +691,13 @@ my @pctopt = map { my ($pct, $key) = @$_;
                              value      => 10, # That's an adult dose, per month; chicks use less.
                              sort       => 250,
                              (map { $_ => 1 } qw(supply good)),
-                             buyqtty    => [qw(dose dozendoses 144 1728 20736 asneeded)],
+                             buyqtty    => [qw(dose dozendoses 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
                            },
               carton => +{ id      => "carton",
                            name    => "egg carton",
                            desc    => "Customers will pay more for your eggs if they are nicely packaged.  Holds one dozen.",
                            assetfg => "white",
-                           buyqtty => [qw(1 12 144 1728 20736 asneeded)],
+                           buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
                            value   => 1,
                            sort    => 300,
                            (map { $_ => 1 } qw(good supply packaging)),
@@ -633,43 +708,52 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          desc    => "Stores will pay more for your eggs if they are neatly packaged.  Holds 12 cartons.",
                          value   => 5,
                          sort    => 301,
-                         buyqtty => [qw(1 12 144 1728 asneeded)],
+                         buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
                          (map { $_ => 1 } qw(good supply packaging)),
                        },
+              emptybag => +{ id      => "emptybag",
+                             phase   => 2,
+                             name    => "bag",
+                             assetfg => "white",
+                             desc    => "Chicken feed is sold in bags.",
+                             value   => 1,
+                             sort    => 302,
+                             buyqtty => [qw(144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                           },
               emptypallet => +{ id      => "emptypallet",
                                 name    => "pallet",
                                 assetfg => "white",
-                                desc    => "Supermarkets will pay more for your eggs if they are nicely palleted up for delivery.  Holds 45 cases.",
+                                desc    => "Stores will pay more for your product if it is nicely palleted up for delivery.  Holds 45 cases or 25 large bags.",
                                 value   => 100,
-                                sort    => 302,
-                                buyqtty => [qw(1 12 144 asneeded)],
+                                sort    => 305,
+                                buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
                                 (map { $_ => 1 } qw(good supply packaging)),
                               },
               emptycontainer => +{ id      => "emptycontainer",
                                    name    => "shipping container (rental)",
-                                   desc    => "Distributors charge less to deliver your eggs if they are packed in standard intermodal shipping containers.  Holds 24 pallets.",
+                                   desc    => "Distributors charge less to deliver your goods if they are packed in standard intermodal shipping containers.  Holds 24 pallets.",
                                    value   => 20000,
-                                   sort    => 303,
+                                   sort    => 306,
                                    assetfg => "grey",
-                                   buyqtty => [qw(1 12 144 asneeded)],
+                                   buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
                                    (map { $_ => 1 } qw(good supply packaging)),
                                  },
               emptyfreighter => +{ id      => "emptyfreighter",
                                    name    => "panamax freighter (rental)",
-                                   desc    => "Loading your eggs onto a freighter allows you to sell them to international markets, which pay a higher price than the domestic market.  This freighter is designed for the new locks, so it holds 6500 forty-foot shipping containers (1300 TEU).",
-                                   sort    => 304,
+                                   desc    => "Loading your goods onto a freighter allows you to sell them to international markets, which pay a higher price than the domestic market.  This freighter is designed for the new locks, so it holds 6500 forty-foot shipping containers (1300 TEU).",
+                                   sort    => 307,
                                    assetfg => "grey",
                                    value   => 120000000,
-                                   buyqtty => [qw(1 12 144 asneeded)],
+                                   buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
                                    (map { $_ => 1 } qw(good supply packaging)),
                                  },
               emptypod => +{ id      => "emptypod",
                              name    => "cargo pod (rental)",
-                             desc    => "Packing your eggs in a standard cargo pod lets you sell them all around the solar system.  Holds 1024 terrestrial shipping containers.",
+                             desc    => "Packing your goods in a standard cargo pod lets you sell them all around the solar system.  Holds 1024 surface freighters.",
                              assetfg => "grey",
-                             sort    => 305,
+                             sort    => 308,
                              value   => 200000000000,
-                             buyqtty => [qw(1 12 144 asneeded)],
+                             buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
                              (map { $_ => 1 } qw(good supply packaging)),
                            },
               coop => +{ id       => "coop",
@@ -680,28 +764,28 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          landsize => 300,
                          sort     => 550,
                          assetfg  => "brown",
-                         buyqtty  => [qw(1 10 100 asneeded)],
+                         buyqtty  => [qw(1 10 100 1000 25000 250000 5000000 asneeded)],
                          (map { $_ => 1 } qw(good housing)),
                        },
               nursery => +{ id        => "nursery",
                             name      => "chick nursery",
-                            desc      => "Holds up to 300 chicks.  Takes up 20 square feet on your land.",
+                            desc      => "Holds up to 300 chicks.  Takes up 10 square feet on your land.",
                             sort      => 500,
                             capacity  => 300,
-                            landsize  => 20,
+                            landsize  => 10,
                             value     => 15000,
                             assetfg   => "brown",
-                            buyqtty   => [qw(1 10 100 asneeded)],
+                            buyqtty   => [qw(1 10 100 1000 25000 250000 5000000 asneeded)],
                             (map { $_ => 1 } qw(good housing)),
                           },
               acre => +{ id       => "acre",
                          name     => "acre of land",
                          plural   => "acres of land",
                          desc     => "Land, on which you can build things, such as chicken coops.",
-                         value    => 10000000,
+                         value    => 5000000,
                          sort     => 700,
                          assetfg  => "green",
-                         buyqtty  => [qw(1 10 100 asneeded)],
+                         buyqtty  => [qw(1 10 100 1000 25000 250000 5000000 asneeded)],
                          (map { $_ => 1 } qw(good housing)),
                          # An acre is nominally 43560 square feet, but you can't actually use quite 100%
                          # of that in practice, because among other things you can't build right at the
@@ -709,9 +793,70 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          # that an acre can support forty thousand square feet of buildings.
                          capacity => 40000,
                        },
+              ffactory => +{ unlocked => +{ buy => +{ }},
+                             unlcrit  => +{ chick   => 100000000,
+                                            hen     => 10000000,
+                                            rooster => 1000000,
+                                          },
+                             id       => "ffactory",
+                             name     => "feed factory",
+                             desc     => "Produces chicken feed.",
+                             (map { $_ => 1 } qw(good)),
+                             assetfg  => "azure",
+                             value    => 20000000,
+                             output   => +{ chickenfeed => 200000, },
+                             buyqtty  => [qw(1 10 100 1000 25000 250000)],
+                             landsize => 200000, # five acres
+                             sort     => 800,
+                           },
+              feedbag => +{ id     => "feedbag",
+                            phase  => 2,
+                            key    => "b",
+                            name   => "bag of chicken feed",
+                            plural => "bags of chicken feed",
+                            value  => 50, # The consumer pays 180, with markup.
+                            (map { $_ => 1 } qw(product feed)),
+                          },
+              feedpallet => +{ id     => "feedpallet",
+                               phase  => 2,
+                               name   => "pallet of chicken feed",
+                               plural => "pallets of chicken feed",
+                               desc   => "This pallet is stacked with 25 large bags of chicken feed.",
+                               retail => 3600, # 144 / bag
+                               value  => 1400, # 56 / bag
+                               (map { $_ => 1 } qw(product feed)),
+                             },
+              feedcontainer => { id     => "feedcontainer",
+                                 phase  => 2,
+                                 name   => "shipping container of chicken feed",
+                                 plural => "shipping containers of chicken feed",
+                                 # Dimensions: 40' x 8' x 8'6".
+                                 # Holds 24 pallets of chicken feed (12 rows of 2).
+                                 desc   => "This shipping container holds 24 pallets of chicken feed.",
+                                 retail => 72000, # 120 / bag
+                                 value  => 36000, # 60 / bag
+                                 (map { $_ => 1 } qw(product feed)),
+                               },
+              feedfreighter => +{ id      => "feedfreighter",
+                                  phase   => 2,
+                                  name    => "freighter loaded with chicken feed",
+                                  plural  => "freighters loaded with chicken feed",
+                                  desc    => "This freighter is loaded with 6500 containers of chicken feed.",
+                                  # At 25 x 24 = 600 bags / container, 6500 containers = 3.9 million bags
+                                  retail  => 390000000, # wholesale = 100 per bag
+                                  value   => 250000000, # 64.10 per bag
+                                  (map { $_ => 1 } qw(product feed)),
+                                },
+              feedpod => +{ id     => "feedpod",
+                            phase  => 2,
+                            name   => "cargo pod full of chicken feed",
+                            plural => "cargo pods of chicken feed",
+                            desc   => "This cargo pod holds 1024 surface freighters of chicken feed.",
+                            value  => 300000000000,
+                            retail => 475000000000,
+                          },
               # TODO:
-              #  * Licenses that allow you to operate in more jurisdictions, increasing the # of acres you can own.
-              #  * Feed plants, which produce chicken feed for you, so you don't have to buy it all.
+              #  * Licenses that allow you to operate in more jurisdictions, increasing the # of acres you can own.  County license, state license, national license, global license, system license, sector license, galaxy license, ...
               #  *
             );
 
@@ -724,11 +869,21 @@ our @genmsg = (undef,
                # TODO: certain genetic levels should provide more specific effects.
               );
 
-%windowitem = init_windowitems();
-ngp();
+#for (1 .. 20) {
+#  my $c = generate_county();
+#  print "$$c{name} ($$c{capitalword}: $$c{capital}),\n\t $$c{size} acres of which $$c{available_land} are available at $$c{landcost}/acre.\n";
+#}
+#exit 0;
+#
+#if ($option{debug} or $option{writepricelist}) {
+#  writepricelist();
+#}
 
-if (-e ($opt{savefile} || catfile(get_config_dir(), "eggs.save"))) {
+if (-e ($option{savefile} || catfile(get_config_dir(), "eggs.save"))) {
   restoregame();
+} else {
+  %windowitem = init_windowitems();
+  ngp();
 }
 push @message, ["Press F1 for help.", "help"];
 refreshscreen();
@@ -756,7 +911,7 @@ while (1) {
   updatetopbar($wtopbar);
   draweggscreen($screen);
 
-  my $delay = $opt{delay} || 1;
+  my $delay = $option{delay} || 1;
   while ($delay > 0) {
     my $since = [gettimeofday()];
     my $key = ReadKey($delay);
@@ -782,21 +937,44 @@ sub ngp {
   #use Data::Dumper; print Dumper(+{ "relatives" => \@relative, chosen_relative => $relative, });
   my ($noun, $pronoun, $possessive) = @$relative;
   my $feed = int(($asset{chickenfeed}{qtty} || 4) / 4); $feed = 4320 if $feed < 4320;
-  my $nurs = int(($asset{nursery}{qtty} || 1) / ($asset{coop}{qtty} || 1)); $nurs = 1 if $nurs < 1;
-  my $acre = int(log(($asset{acre}{qtty} || 1)) / log(tau)); $acre = 1 if $acre < 1;
+  my $nurs = int(($asset{nursery}{qtty} || 1) / (int($asset{coop}{qtty} * 2 / 3) || 1)); $nurs = 1 if $nurs < 1;
+  my $acre = int(log(($asset{acre}{qtty} || 1)) / log(tau * 2 / 3)) + int($asset{acre}{qtty} / 27);
   my $vita = int($asset{vitamins}{qtty} / 4);
-  my $coop = int($asset{coop}{qtty} / 4) || 1;
-  # TODO: enough licenses to cover that acreage.
+  my $coop = int(log(($asset{coop}{qtty} || 1)) / log(tau)) + int($asset{coop}{qtty} / 25) + 1;
+  my $fact = int(log(($asset{ffactory}{qtty} || 1)) / log(tau)) || 0;
+  if ($fact > 10) {
+    debuglog("Factory Phase, Activate.");
+    $gamephase = 2 if $gamephase < 2;
+    # TODO: if keeping a good number of factories, move into a
+    #       phase of the game wherein you sell excess chicken feed.
+  }
+  while (((($coop * 2 * $asset{coop}{landsize})
+           + ($nurs * 2 * $asset{nursery}{landsize})
+           + ($fact * 1 * $asset{ffactory}{landsize}))
+          > ($acre * $asset{acre}{capacity}))
+         and ($acre < $asset{acre}{qtty})) {
+    # TODO: use a more efficient algorithm here.  This is O(n).
+    $acre++;
+  }
+  $acre ||= 1;
+  # TODO: enough licenses to cover the acreage.
   @message  = (["So there you are, penniless and fresh out of school, wondering what you're going to do now, and it seems your $noun has just died; and $pronoun left you "
                 . (($acre == 1) ? "an acre" : shownum($acre) . " acres") . " of land, with "
-                . (($coop == 1) ? "a chicken coop" : shownum($coop)) . " chicken coops"
+                . ((($fact >= 1) ? (($fact == 1)
+                                    ? "a chicken-feed factory "
+                                    : shownum($fact) . " chicken-feed factories, ")
+                    : ""))
+                . ((($coop == 1) ? "a chicken coop" : (shownum($coop)) . " chicken coops"))
                 . " on it, and $possessive best laying hen.  ", "story"]);
   @messageline = ();
-  rewrap_message_log();
+  rewrap_message_log($wmessages);
   %cashflow = map { $_ => +{} } qw(current lastmonth year lastyear total);
   $cash = 0;
   $runstarted = $date;
-  $ngpeta     = $runstarted->clone()->add(years => 40 + int rand 40, days => 1 + int rand 365 );
+  $ngpeta     = $runstarted->clone()->add(years => (40 + int rand 40),
+                                          days  => (1 + int rand 365));
+  $birthdate  = $runstarted->clone()->subtract( years  => (19 + int rand 6),
+                                                days   => (1 + int rand 365), );
 
   my %keepasneeded = map { $_ => 1 } qw(chickenfeed
                                         carton case emptypallet emptycontainer emptyfreighter emptypod
@@ -813,11 +991,13 @@ sub ngp {
   }
   addasset("hen", 1);
   addasset("chickenfeed", $feed);
+  addasset("carton", 144) if $asset{carton}{unlocked}{buy}{144};
   addasset("coop", $coop);
   addasset("nursery", $nurs);
   addasset("acre", $acre);
+  addasset("ffactory", $fact);
   # TODO: licenses and such
-  if ($opt{pauseonngp}) {
+  if ($option{pauseonngp}) {
     toggle_pause("force_pause_on");
   }
 }
@@ -836,17 +1016,47 @@ sub iterate {
     $dt = $dt->add(days => 1);
     $days++;
   }
+  debuglog("iterate(): $days days pass.");
   if ($ngpeta->ymd() lt $date->ymd()) {
     if ($asset{hen}{qtty} < 1) {
       print $reset . gotoxy(0,0)
         . chr(27) . "[2J" # clear-screen
         . gotoxy(0,0)
         . $reset . "Your will calls for your best prize laying hen to be left to your heir.\nUnfortunately, you no longer have that hen.\nYour will is tied up in probate for decades, and your heir never gets into the egg business.\n\n";
-      unlink $opt{savefile} unless $opt{debug};
+      unlink $option{savefile} unless $option{debug};
       exit 0;
     }
     ngp();
+  } elsif (($birthdate->month() eq $date->month()) and
+           ($birthdate->mday() eq $date->mday())) {
+    my $age = int($date->year() - $birthdate->year());
+    push @message, [qq[Happy Birthday!  You are now $age years old.], "occasion"];
   }
+  for my $producer (grep { ($asset{$_}{qtty} > 0) and (ref $asset{$_}{output}) } keys %asset) {
+    # Assets that produce other assets, for now, is just feed factories making chicken feed.
+    # But I implemented it in a general way, because the nature of idle games is, they grow.
+    debuglog("iterate: $asset{$producer}{qtty} "
+             . sgorpl($asset{$producer}{qtty}, ($asset{$producer}{name} || $producer), $asset{$producer}{plural}));
+    for my $product (keys %{$asset{$producer}{output}}) {
+      $asset{$product}{qtty} += $asset{$producer}{output}{$product} * $asset{$producer}{qtty};
+      #push @message, ["Your " . shownum($asset{$producer}{qtty}) . " "
+      #                . sgorpl($asset{$producer}{qtty}, ($asset{$producer}{name} || $producer), $asset{$producer}{plural})
+      #                . " " . inflectverb($asset{$producer}{qtty}, "produces", "produce")
+      #                . " " . shownum($asset{$producer}{output}{$product}  * $asset{$producer}{qtty}) . " "
+      #                . sgorpl($asset{$producer}{output}{$product} * $asset{$producer}{qtty}, ($asset{$product}{name} || $product), $asset{$product}{plural})
+      #                . ". ", "assetgain"];
+    }}
+  for my $lockedproducer (grep { (ref $asset{$_}{output}) and
+                                   not $asset{$_}{unlocked}{buy}{$asset{$_}{buyqtty}[0]}
+                                 } keys %asset) {
+    debuglog("iterate: Can we unlock '$lockedproducer'?");
+    for my $prereq (keys %{$asset{$lockedproducer}{unlcrit}}) {
+      if ($asset{$prereq}{qtty} >= $asset{$lockedproducer}{unlcrit}{$prereq}) {
+        my ($qtty) = @{$asset{$lockedproducer}{buyqtty}};# $qtty ||= 1;
+        debuglog("Attempting to unlock buy quantity $qtty ($buyqtty{$qtty}{id})");
+        $asset{$lockedproducer}{unlocked}{buy}{$buyqtty{$qtty}{id}} ||= 1;
+        debuglog("Yes, unlocked " . $asset{$lockedproducer}{plural} || makeplural($asset{$lockedproducer}{name} || $lockedproducer));
+      }}}
   if (($asset{vitamins}{qtty} > 0) or ($asset{vitamins}{asneeded})) {
     for my $chickentype (grep { $asset{$_}{qtty} > 0 } qw(hen rooster chick)) {
       $asset{$chickentype}{needvitamins} ||= $date->ymd();
@@ -868,8 +1078,8 @@ sub iterate {
   if ($date->mday() == 1) {
     update_levels();
     monthly_expenses();
-    savegame() if $opt{autosave} eq "monthly";
-    if ($opt{debug}) {
+    savegame() if $option{autosave} eq "monthly";
+    if ($option{debug}) {
       use Data::Dumper;
       debuglog("Cashflow: " . Dumper(\%cashflow, +{ year  => $date->year(),
                                                     month => $date->month(),
@@ -884,14 +1094,17 @@ sub iterate {
       $cashflow{year} = +{};
       $cashflow{sc}{lastyear} = $cashflow{sc}{year};
       $cashflow{sc}{year} = +{};
-      savegame() if $opt{autosave} eq "annually";
+      savegame() if $option{autosave} eq "annually";
     }
   }
   my $mealsneeded = $days * int($asset{hen}{qtty} + $asset{rooster}{qtty} + (($asset{chick}{qtty} + 3) / 7));
   $asset{chickenfeed}{qtty} -= $mealsneeded;
   debuglog("chickenfeed: $asset{chickenfeed}{qtty}");
+  my $excess = 0;
   if (($asset{chickenfeed}{qtty} <= 0) and ($asset{chickenfeed}{asneeded})) {
     buyatleast("chickenfeed", $mealsneeded, "need");
+  } elsif ($gamephase >= 2) {
+    $excess = $asset{chickenfeed}{qtty} - ($mealsneeded * 31 * $asset{chick}{lifespan}{months});
   }
   if ($asset{chickenfeed}{qtty} + ($mealsneeded / 2) < 0) {
     for my $x (["hen"     => int(valuefromexpectations(12, $asset{hen}{qtty}))],
@@ -905,15 +1118,19 @@ sub iterate {
       # any case it's _simplest_, because we can just process groups
       # in the order in which they were added, i.e., oldest first.
       for my $group (@{$asset{$atype}{agegroup} || +[]}) {
-        my $kill = $numdead - $degrouped;
+        my $kill = $numdead - ($degrouped || 0);
         $kill = $$group{qtty} if $kill > $$group{qtty};
         $$group{qtty} -= $kill;
         $asset{$atype}{qtty} -= $kill;
         $degrouped += $kill;
       }
       $asset{$atype}{agegroup} = [grep { $$_{qtty} > 0 } @{$asset{$atype}{agegroup}}];
-      push @message, [$degrouped . " " . sgorpl($degrouped, $asset{$atype}{name}) . " starved.", "assetloss"]
-        if $degrouped > 0;
+      if ($degrouped > 0) {
+        push @message, [$degrouped . " " . sgorpl($degrouped, $asset{$atype}{name}) . " starved.", "assetloss"];
+        # We aren't going to _mention_ it to the player, but the others will eat them
+        # (which helps prevent mass-starvation events from becoming a tpk too quickly):
+        $asset{chickenfeed}{qtty} += (($atype eq "chick") ? 1 : 6) * $degrouped;
+      }
     }
   }
   $asset{chickenfeed}{qtty} = 0 if $asset{chickenfeed}{qtty} < 0;
@@ -941,19 +1158,19 @@ sub iterate {
         while ($keepchicks and not canhouse($keepchicks, "nursery")) {
           # Sell off excess chicks if there isn't enough nursery space.
           my $sell = ($keepchicks < 10) ? 1 : int($keepchicks / 2);
-          my $per  = ($opt{sellchickens} eq "m") ? 1 : ($asset{chick}{value} / 2);
+          my $per  = ($option{sellchickens} eq "m") ? 1 : ($asset{chick}{value} / 2);
           my $price = int($sell * $per);
           gaincash($price, "sales", "chicks");
           $keepchicks -= $sell;
           $soldchicks += $sell;
           # If selling live chicks, your competitors get any genetic enhancements you've got.
-          if (($sell > 0) and ($opt{sellchickens} ne "m")) {
+          if (($sell > 0) and ($option{sellchickens} ne "m")) {
             $genleak = $genlvl if $genleak < $genlvl;
           }
         }
         $asset{nursery}{unlocked}{buy}{1} ||= 1 if $soldchicks;
         push @message, ["Sold " . shownum($soldchicks) . " " .
-                        sgorpl($soldchicks, (($opt{sellchickens} eq "m") ? "chick nugget" : "chick"))
+                        sgorpl($soldchicks, (($option{sellchickens} eq "m") ? "chick nugget" : "chick"))
                         . ".", "assetsold"]
           if $soldchicks;
         addasset("chick", $keepchicks) if $keepchicks;
@@ -961,15 +1178,27 @@ sub iterate {
     }
   }
   $asset{egg}{qtty} += $laid;
-  for my $grouping ([ 12,   "egg", "dozen", "carton"],
-                    [ 12,   "dozen", "gross", "case"],
-                    [ 45,   "gross", "palletload", "emptypallet", ],
-                    [ 24,   "palletload", "containerload", "emptycontainer" ],
-                    [ 6500, "containerload", "panamaxload", "emptyfreighter" ],
-                    [ 1024, "panamaxload", "podload", "emptypod", ],
-                   ) {
+  my @egggrouping = ([ 12,   "egg", "dozen", "carton"],
+                     [ 12,   "dozen", "gross", "case"],
+                     [ 45,   "gross", "palletload", "emptypallet", ],
+                     [ 24,   "palletload", "containerload", "emptycontainer" ],
+                     [ 6500, "containerload", "panamaxload", "emptyfreighter" ],
+                     [ 1024, "panamaxload", "podload", "emptypod", ],
+                    );
+  my @feedgrouping = ([ 150,  "chickenfeed", "feedbag", "emptybag"],
+                      [ 25,   "feedbag", "feedpallet", "emptypallet"],
+                      [ 24,   "feedpallet", "feedcontainer", "emptycontainer" ],
+                      [ 6500, "feedcontainer", "feedfreighter", "emptyfreighter" ],
+                      [ 1024, "feedfreighter", "feedpod", "emptypod" ],
+                     );
+  my @grp = @egggrouping;
+  if (($gamephase >= 2) and ($excess > $asset{feedbag}{number})) {
+    @grp = (@grp, @feedgrouping);
+  }
+  for my $grouping (@grp) {
     my ($per, $item, $group, $container) = @$grouping;
-    my $n = int($asset{$item}{qtty} / $per);
+    my $sellqtty = ($item eq "chickenfeed") ? $excess : $asset{$item}{qtty};
+    my $n = int($sellqtty / $per);
     if ($asset{$container}{qtty} < $n) {
       if ($asset{$container}{asneeded}) {
         my $containersneeded = $n - $asset{$container}{qtty};
@@ -984,19 +1213,27 @@ sub iterate {
       $asset{$item}{qtty}      -= $n * $per;
       $asset{$group}{qtty}     += $n;
       debuglog("Grouped " . $n * $per . " of $item into $n of $container.")
-        if $opt{debug} > 5;
+        if $option{debug} > 5;
     } else {
       debuglog("Failed to group " . $n * $per . " of $item into $n of $container.");
     }
   }
   my $sellunit = "egg";
-  for my $u (qw(dozen gross paletteload containerload)) {
+  for my $u (qw(dozen gross paletteload containerload panamaxload podload)) {
     if ($asset{$u}{qtty} > 0) {
       $sellunit = $u;
     }}
   my $newmoney = $asset{$sellunit}{value} * $asset{$sellunit}{qtty};
   $asset{$sellunit}{qtty} = 0;
   gaincash($newmoney, "sales", "eggs");
+  $sellunit = "feedbag";
+  for my $u (qw(feedpallet feedcontainer feedfreighter feedpod)) {
+    if ($asset{$u}{qtty} > 0) {
+      $sellunit = $u;
+    }}
+  $newmoney = $asset{$sellunit}{value} * $asset{sellunit}{qtty};
+  $asset{$sellunit}{qtty} = 0;
+  gaincash($newmoney, "sales", "chicken feed") if $newmoney;
   # Things age over time:
   for my $atype (grep { $asset{$_}{lifespan} } keys %asset) {
     for my $grp (@{$asset{$atype}{agegroup}}) {
@@ -1024,10 +1261,11 @@ sub update_levels {
 
 sub monthly_expenses {
   my ($examsetting) = grep { $$_{name} eq $budget{medexam}{value} } @{$budget{medexam}{enum}};
-  if (($$examsetting{timesperyear} > 0) and not ($date->month() % $$examsetting{timesperyear})) {
+  if (($$examsetting{timesperyear} > 0) and not ($date->month() % int(12 / $$examsetting{timesperyear}))) {
     my $numofchickens = $asset{hen}{qtty} + $asset{rooster}{qtty} + $asset{chick}{qtty};
+    my $numofexams = $asset{hen}{qtty} + $asset{rooster}{qtty} + ($asset{chick}{qtty} / 15);
     if ($numofchickens > 0) {
-      my $examscost   = 300 * $numofchickens;
+      my $examscost   = int(30 * $numofexams);
       expendcash($examscost, "budget", "medical exams");
       for my $ctype (qw(hen rooster chick)) {
         $asset{$ctype}{examined} = $date->ymd();
@@ -1045,9 +1283,12 @@ sub expire_asset {
   if ($asset{$atype}{qtty} < 0) { $asset{$atype}{qtty} = 0; }
   my %sold;
   if ($atype eq "chick") {
-    my $hens = valuefromexpectations(chicken_health_ev(65, "chick", "hen"), $qtty);
-    $hens = $qtty if $hens > $qtty;
-    my $remaining = $qtty - $hens;
+    my $grewup = valuefromexpectations(chicken_health_ev(90, "chick", "hen"), $qtty);
+    $grewup = $qtty if $grewup > $qtty;
+    my $roosters = ($grewup > 0) ? valuefromexpectations(chicken_health_ev(5, "chick", "rooster"), $qtty) : 0;
+    $roosters = int($qtty / 4) if $roosters > ($qtty / 4);
+    my $hens = $grewup - $roosters;
+    my $remaining = $qtty - $grewup;
     if ($hens > 0) {
       my $keephens = $hens;
       while ($keephens and not canhouse($keephens, "coop")) {
@@ -1055,7 +1296,7 @@ sub expire_asset {
         # off at best price or to a good home, your competitors
         # benefit from genetic enhancements you've created.
         my $sell = ($keephens < 10) ? 1 : int($keephens / 2);
-        my $per  = ($opt{sellchickens} eq "m")
+        my $per  = ($option{sellchickens} eq "m")
           ? ($asset{hen}{value} / 3)
           : ($asset{hen}{value} / 2);
         my $price = int($sell * $per);
@@ -1067,33 +1308,29 @@ sub expire_asset {
       push @message, [shownum($hens) . " " . sgorpl($hens, "chick")
                       . " grew up into " . sgorpl($hens, "a hen", "hens") . ".", "assetgain"];
     }
-    if ($remaining > 0) {
-      my $roosters = valuefromexpectations(chicken_health_ev(25, "chick", "rooster"), $remaining);
-      $roosters = $remaining if $roosters > $remaining;
-      if ($roosters > 0) {
-        push @message, [shownum($roosters) . " " . sgorpl($roosters, "chick")
-                        . " grew up into " . sgorpl($roosters, "a rooster", "roosters") . ".", "assetgain"];
-        my $keeproosters = $roosters;
-        while ($keeproosters and not canhouse($keeproosters, "coop")) {
-          # Sell off excess roosters.  You don't get full value.
-          my $sell = ($keeproosters < 10) ? $keeproosters : int($keeproosters / 2);
-          my $per  = ($opt{sellchickens} eq "m")
-            ? ($asset{hen}{value} / 4) # For meat, roosters are actually worth _less_ than hens.  Tougher meat, only good for soup.
-            : ($asset{rooster}{value} / 2);
-          my $price = int($sell * $per);
-          gaincash($price, "sales", "roosters");
-          $keeproosters -= $sell;
-          $sold{rooster} += $sell if $sell > 0;
-        }
-        addasset("rooster", $keeproosters) if $keeproosters > 0;
+    if ($roosters > 0) {
+      push @message, [shownum($roosters) . " " . sgorpl($roosters, "chick")
+                      . " grew up into " . sgorpl($roosters, "a rooster", "roosters") . ".", "assetgain"];
+      my $keeproosters = $roosters;
+      while ($keeproosters and not canhouse($keeproosters, "coop")) {
+        # Sell off excess roosters.  You don't get full value.
+        my $sell = ($keeproosters < 10) ? $keeproosters : int($keeproosters / 2);
+        my $per  = ($option{sellchickens} eq "m")
+          ? ($asset{hen}{value} / 4) # For meat, roosters are actually worth _less_ than hens.  Tougher meat, only good for soup.
+          : ($asset{rooster}{value} / 2);
+        my $price = int($sell * $per);
+        gaincash($price, "sales", "roosters");
+        $keeproosters -= $sell;
+        $sold{rooster} += $sell if $sell > 0;
       }
-      if ($remaining > $roosters) {
-        my $died = $remaining - $roosters;
-        if (($asset{$atype}{qtty} == 0) and ($hens == 0) and ($roosters == 0)) {
-          push @message, ["Your " . sgorpl($qtty, "chick") . " died :-(", "assetloss"];
-        } else {
-          push @message, [shownum($died) . " " . sgorpl($died, "chick") . " died.", "assetloss"];
-        }
+      addasset("rooster", $keeproosters) if $keeproosters > 0;
+    }
+    if ($remaining > 0) {
+      my $died = $remaining - $roosters;
+      if (($asset{$atype}{qtty} == 0) and ($hens == 0) and ($roosters == 0)) {
+        push @message, ["Your " . sgorpl($qtty, "chick") . " died :-(", "assetloss"];
+      } else {
+        push @message, [shownum($died) . " " . sgorpl($died, "chick") . " died.", "assetloss"];
       }
     }
   } elsif (($atype eq "hen") or ($atype eq "rooster")) {
@@ -1109,15 +1346,15 @@ sub expire_asset {
   }
   if (keys %sold) {
     debuglog("coop unlock " . $asset{coop}{unlocked}{buy}{1}++);
-    if ($opt{sellchickens} ne "m") {
+    if ($option{sellchickens} ne "m") {
       $genleak++ if (($genleak < $genlvl) and ( 5 > rand 100));
     }
     push @message, ["Sold " . (commalist(map {
       my $atype = $_;
-      my $sname = ($opt{sellchickens} eq "m")
+      my $sname = ($option{sellchickens} eq "m")
         ? ($asset{$atype}{sellname} || $asset{$atype}{name})
         : $asset{$atype}{name};
-      my $splur = ($opt{sellchickens} eq "m")
+      my $splur = ($option{sellchickens} eq "m")
         ? ($asset{$atype}{sellplural} || $asset{$atype}{plural})
         : $asset{$atype}{plural};
       shownum($sold{$atype}) . " " . sgorpl($sold{$atype}, $sname, $splur);
@@ -1139,9 +1376,18 @@ sub chicken_health_ev {
 
 sub chicken_health_modifiers {
   my ($ctype, $reason) = @_;
+  my ($lastexamdate) = $asset{$ctype}{examined} || "1970-01-01";
+  my $monthssincelastexam = 0;
+  my $dt = $date->clone();
+  # TODO: This is O(n).  Replace it with an O(1) formula.
+  while ($dt->ymd() ge $lastexamdate) {
+    $dt = $dt->subtract( months => 1 );
+    $monthssincelastexam++;
+  }
   my %mod = ( vitamins => (($asset{$ctype}{needvitamins} ge $date->ymd())
                            ? 1.1
                            : 1),
+              medexams => (1 + (1 / ($monthssincelastexam || 1))),
               # TODO: immunizations
               breeding => (1 + ($breedlvl / 50)),
             );
@@ -1173,7 +1419,7 @@ sub canhouse {
   # Can we house $n _additional_ chickens in our coops (or chicks in our nurseries)?
   debuglog("canhouse($n, $housingtype)");
   if (not $n) {
-    if ($opt{debug}) { croak "canhouse(0, $housingtype)"; }
+    if ($option{debug}) { croak "canhouse(0, $housingtype)"; }
     return; # No infinite loops pls, kthx.
   }
   my $capacity = $asset{$housingtype}{qtty} * $asset{$housingtype}{capacity};
@@ -1244,10 +1490,12 @@ sub canbuild {
       $asset{acre}{unlocked}{buy}{1}++;
       push @message, ["You need more land to build on.", "assetneed"];
     }
+    return;
   }
   # TODO: check licenses.
-  buyasset("acre", $acresneeded, $value, "canbuild");
-  return $number;
+  if (buyasset("acre", $acresneeded, $value, "canbuild")) {
+    return $number;
+  }
   return;
 }
 
@@ -1342,6 +1590,142 @@ sub trackage {
   }
 }
 
+sub generate_county {
+  my $name = generate_placename(county_prefix(), county_suffix());
+  my $seat = generate_placename(city_prefix(), city_suffix());
+  my $size = int(15000 + ((1 + rand 15000) * (1 + rand 25) * (1 + rand 100)));
+  my $land = int((1 + rand (sqrt($size))) * (1 + rand(sqrt($size))));
+  my $mult = ((50 > rand 100)
+              ? 1 + (((rand 5) || 1) * ((rand 2) || 0.1) * ((rand 2) || 0.25))
+              : ((100 - (((rand 5) || 1) * (rand(5) || 0.1) * (rand(3) || 0.2))) / 100));
+  return +{ name           => $name,
+            capital        => $seat,
+            capitalword    => "County Seat", # TODO: some larger jurisdictions may use a different term.
+            size           => $size, # Total size of the county, in acres.
+            owned_land     => 0,     # Number of acres the player already owns.
+            available_land => $land, # Number of acres the player can potentially purchase.
+            landcost       => int($asset{acre}{value} * $mult),
+          },
+}
+
+sub generate_placename {
+  my ($prefix, $suffix) = @_;
+  my ($basename, @option);
+  if (70 > rand 100) {
+    # Try to pick a common placename:
+    @option = ("Smith", "Lincoln", "Franklin", "Clinton", "Johnson",
+               "George", "Elizabeth", "Virginia", "Victoria", "Henry",
+               "Chester", "Marion", "Bristol", "Dover", "Salem", "Win", "Mil", "Milton",
+               "Lebanon", "Alexandria", "Antioch", "Berlin", "Birmingham", "Athen", "Blooming",
+               "Paris", "Cairo", "Burling", "Vernon", "Cleveland", "Hudson", "Beacon",
+               "Spring", "Summer", "Winter", "Love", "Day", "Man", "Ox", "New",
+               "Clay", "Sand",  "Ash", "Burn",
+               "Farm", "Farmer", "River", "Rivers", "King", "Kings", "Castle",
+               "Green", "Black", "White", "Red", "Blue", "Dark", "Light", "Hard", "Soft",
+               "Washington", "Adams", "Jefferson", "Madison", "Monroe", "Harrison",
+               "Payne", "Taylor", "Tyler", "Pierce", "Hayes", "Garfield", "Arthur",
+               "Roosevelt", "Wilson", "Harding", "Hoover", "Kennedy", "Ford", "Reagan",
+               "Vanderbilt", "Carnegie", "Rockefeller", "Buffett", "Jacobs",
+               "Nelson", "Davis", "Lee", "Grant", "Jackson", "Sherman",
+               "Patton", "MacArthur", "Marshall", "Pershing",
+               "Euler", "Kline", "Gauss", "Euclid", "Bernoulli", "Newton", "Lowe",
+               "Torvalds", "Wall", "Knuth", "Raymond", "Ritchie", "Kernighan",
+               "Oak", "Maple", "Hazel", "Hickory", "Pine", "Spruce",
+               "Pleasant", "Good", "Right", "Center", "Fair", "Wood",
+              );
+    if ($suffix eq "ton") {
+      push @option, $_ for (qw(Arling Lexing Ea));
+      @option = map { s/t$//; $_ } @option;
+    }
+  } else {
+    @option = map { randomplaceword() } 1 .. 30;
+  }
+  my $tries = 0;
+  while (((not $basename) or (grep { $_ eq $basename } @extantplace) or
+          (index(lc($basename), lc($suffix)) > 0) or
+          (index(lc($basename), lc($prefix)) > 0))
+         and ($tries < 50)) {
+    $basename = $option[int rand @option];
+    if (5 > rand 100) {
+      my @joiner = ("", " ", "-");
+    }
+  }
+  return $prefix . $basename . $suffix;
+}
+sub city_prefix {
+  return "" if 60 > rand 100;
+  my @option = ("North ", "South ", "East ", "West ",
+                "New ", "New ", "New ", "Old ",
+                "Port ", "Mount ", "Royal ", "Pleasant ", "Fair ",
+               );
+  return $option[int rand @option];
+}
+sub commonplacewordsuffixes {
+  return ("field", "port", "land", "haven", "gate", "crest", "fair",
+          "chester", "castle", "bank", "dale", "hurst");
+}
+sub city_suffix {
+  return "" if 50 > rand 100;
+  my (@option) = map { $_, $_, $_, $_, $_ } (qw(ton berg sberg burg ville town ia s side ford));
+  push @option, $_ for (commonplacewordsuffixes(),
+                        " Valley", " Lake", " Beach", " Falls", " Wood", " City", " Junction",
+                        " Harbor", " Point", " Heights", " Hills", " Landing", " Center", " Grove");
+  for my $maybe ("view", " Park", " Pier", " Road", " Ford", " Township", " Village",
+                 "home", "house") {
+    push @option, $maybe if 30 > rand 100;
+  }
+  return $option[int rand @option];
+}
+sub county_prefix {
+  return "";
+}
+sub county_suffix {
+  # TODO: Make this deterministic, depending on which larger jurisdiction you're in.
+  my (@option) = (" County", " County", " County", " County", " County", " County", " County", " County",
+                  "shire", " Shire", "shire County", " MSA",
+                  " Parish", " Borough", " Section", " District", " Division",
+                 );
+  return $option[int rand @option];
+}
+
+sub randomplaceword {
+  my @syllable = map { randomplacesyllable() } 1 .. 2 + (int(rand 2) * (rand 2) * (rand 2));
+  if ((4 > scalar @syllable) and (40 > rand 100)) {
+    my @suffix = ("er", "er", "er", "er", "ing", "ing", "ing",
+                  "a", "ia", "ac", "in", "en", "on", "ie", "ish",
+                  "le", "lisle", "son", "ham", "ona", "ora",
+                  "berg", "burg", "land", "pont",
+                  "ick", "stead", "aide", "ette",
+                  commonplacewordsuffixes(),
+                 );
+    push @syllable, $suffix[int rand @suffix];
+  }
+  my $word = join "", @syllable;
+  $word =~ s/(.)\1\1/$1$1/g;
+  return ucfirst $word;
+}
+sub randomplacesyllable {
+  my @initial = (qw(b b b b b b br bl c c c ch cl cr chr d d d d d dr dl f f f
+                    fr fl g g gh gr gl h j k k k l l l m m m m n n n n
+                    p p p pr pl ph pf qu r r r r r r r
+                    s s s s s s sh sc sch st st st str str sk sl sm sn sn sp sw sz
+                    t t t t t t t t tr tr tr tr th th th thr v w w y z),
+                 "", "", "", "", "", "", "");
+  my @vowel   = (qw(a e i o u a e i o u a e i o u a a a e e e i i o o o
+                    a e i o u a e i o u a e i o u a a a e e e i i o o o
+                    ai ae au ea ee ei ia ie oa oe oi oi oo oo oo y ui
+                    ay oy aw ew ow ow));
+  my @final   = (qw(b b b b b rb cc ch rch lch nch ck ck ck d d d d
+                    nd rd ld ff ff lf rf g g gg gh h k k k l l l ll ll
+                    m m m m mm mm rm lm n n n n nn nn nn rn ln
+                    p p pp pp lp rp np r r r r rr rr
+                    s s s s s s ss ss ss sh sh rsh lsh rs ls ns gs cs
+                    t t t t tt tt tt rt rt st st rst mt pt ft nt nt ct
+                    v vv lv rv th th th rth lth phth mth x x z zz zh),
+                 "", "", "", "", "", "", "");
+  return $initial[int rand @initial] . $vowel[int rand @vowel] . $final[int rand @final];
+}
+
 sub expendcash {
   my ($amount, $type, $subcat) = @_;
   $cash -= $amount;
@@ -1376,7 +1760,7 @@ sub trackcashflow {
 
 sub updatetopbar {
   my ($w) = @_;
-  my $now = DateTime->now( time_zone => $opt{localtimezone} );
+  my $now = DateTime->now( time_zone => $option{localtimezone} );
   my $dtext = $date->year() . " " . $date->month_abbr() . " " . $date->mday()
     . " " . $date->day_abbr()
     . ($paused ? " PAUSED" : "");
@@ -1397,6 +1781,89 @@ sub toggle_pause {
     $paused = 1;
     push @message, ["Paused. ", "meta"];
   }
+}
+
+sub writepricelist {
+  my ($filename) = @_;
+  $filename ||= "price-chart.txt";
+  my (%packagemin, %packagemax, %numincluded);
+  my %basicunit = ( "feed" => " / bag",
+                    "egg"  => " each");
+  my @note;
+  my @entry = map {
+    my ($product, $label, $id, $nsub, $subunit, $pkg, $retailmult) = @$_;
+    #print "writepricelist(): evaluating $product by $label <$id> / $nsub / $subunit / $pkg\n";
+    my $value = $asset{$id}{value} || "?";
+    my ($pkgmin, $pkgmax);
+    if (defined $pkg) {
+      for my $q (grep { $_ ne "asneeded" } @{$asset{$pkg}{buyqtty}}) {
+        my $number = $buyqtty{$q}{number}; die "invalid number, '$number'" if not ($number > 0);
+        my $pmult  = $buyqtty{$q}{pmult} || 1;
+        my $total  = $asset{$pkg}{value} * $pmult;
+        my $per    = $total / $number;
+        if ($per > $value) {
+          push @note, "$product sells for more than its value when sold by the " . ($buyqtty{$q}{name} || $q)
+            if $pkgmax ne $value;
+        }
+        if ((not defined $pkgmin) or ($per < $pkgmin)) {
+          $pkgmin = $per;
+        }
+        if ((not defined $pkgmax) or ($per > $pkgmax)) {
+          $pkgmax = $per;
+        }
+      }
+    }
+    $pkgmin ||= 0;
+    $pkgmax ||= 0;
+    if (defined $subunit) {
+      $pkgmin += ($packagemin{$subunit} || 0);
+      $pkgmax += ($packagemax{$subunit} || 0);
+    }
+    $packagemin{$id} = $pkgmin;
+    $packagemax{$id} = $pkgmax;
+    my $number = (defined $subunit) ? (($numincluded{$subunit} || 1) * $nsub) : 1;
+    $numincluded{$id} = $number;
+    my $totalvalue = ($value + 0) ? ($value + ($pkgmin || 0)) : "?";
+    my $costperunit = $number ? (($totalvalue + 0) ? (sprintf "%0.2f", ($totalvalue / $number)) : "?") : "E";
+    my $retail = ($asset{$id}{retail})
+      ? ($asset{$id}{retail} . " (" . (sprintf "%0.2f", $asset{$id}{retail} / $number) . $basicunit{$product} . ")")
+      : ($retailmult ? (($retailmult * $number) . " (" . $retailmult . "$basicunit{$product})") : "?");
+    [$label, $number, $value, (($pkgmin || $pkgmax) ? (sprintf "%0.2f - %0d", $pkgmin, $pkgmax) : "N/A"), (sprintf "%0.2f", $totalvalue), $costperunit, $retail];
+  } (["egg", "Egg",            "egg",          undef, undef,           undef,            50 ],
+     ["egg", "Dozen (Carton)", "dozen",           12, "egg",           "carton",         20 ],
+     ["egg", "Gross (Case)",   "gross",           12, "dozen",         "case",           18],
+     ["egg", "Pallet",         "palletload",      45, "gross",         "emptypallet",    15],
+     ["egg", "Container",      "containerload",   24, "palletload",    "emptycontainer", 12],
+     ["egg", "Freighter",      "panamaxload",   6500, "containerload", "emptyfreighter", 10],
+     ["egg", "POD",            "podload",       1024, "panamaxload",   "emptypod"],
+     ["feed", "Feed Bag",      "feedbag",      undef, undef,           "emptybag",       $asset{chickenfeed}{value} * $buyqtty{feedbag}{pmult}],
+     ["feed", "Pallet",        "feedpallet",      25, "feedbag",       "emptypallet",    $asset{chickenfeed}{value} * $buyqtty{feedpallet}{pmult}],
+     ["feed", "Container",     "feedcontainer",   24, "feedpallet",    "emptycontainer"],
+     ["feed", "Freighter",     "feedfreighter", 6500, "feedcontainer", "emptyfreighter"],
+     ["feed", "POD",           "feedpod",       1024, "feedfreighter", "emptypod"],
+    );
+  unshift @entry, ["-------", "-", "-----", "--------", "-----", "---------", "------------"];
+  unshift @entry, ["Product", "#", "Value", "Pkg Cost", "Total", "Cost/Unit", "Retail Price"];
+  for my $colno (0 .. 5) {
+    my $maxwidth = 0;
+    #print "writepricelist(): finding max width of column $colno\n";
+    for my $row (@entry) {
+      #print " * checking entry: '$$row[$colno]'\n";
+      my $w = length($$row[$colno]);
+      $maxwidth = $w if $w > $maxwidth;
+    }
+    for my $row (@entry) {
+      while (length($$row[$colno]) < $maxwidth) {
+        $$row[$colno] = " " . $$row[$colno];
+      }
+    }
+  }
+  open LST, ">", $filename;
+  for my $row (@entry) {
+    print LST join " ", @$row;
+    print LST "\n";
+  }
+  close LST;
 }
 
 #################################################################################################
@@ -1434,7 +1901,7 @@ sub settings_items {
       my $o = $_;
       +{ key   => $$o{key},
          name  => $$o{name},
-         value => $opt{$$o{name}},
+         value => $option{$$o{name}},
        },
      } grep {
        $$_{key},
@@ -1517,15 +1984,18 @@ sub init_windowitems {
    buy => sub {
      my $k = "a";
      if ($buyitem) {
-       return (+{ name => ucfirst $asset{$buyitem}{name},
+       return (+{ name => ucfirst $asset{$buyitem}{name},# . " <" . $asset{$buyitem}{id} . ">",
                   fg   => "teal",
                 },
+               #(+{ name => join("", "[", (keys %{ $asset{$buyitem}{unlocked}{buy}}), "]"),
+               #    fg   => "orange",
+               #  }),
                map {
                  my $qid = $_;
                  my $q = $buyqtty{$qid};
                  my $price = $$q{price} || $asset{$buyitem}{value} * $$q{pmult};
                  +{ key     => $$q{key},
-                    name    => $$q{name},
+                    name    => $$q{name},# . " <" . $$q{id} . ">",
                     number  => $$q{number},
                     value   => (($$q{number} eq "asneeded")
                                 ? ($asset{$buyitem}{asneeded} ? "(on)" : shownum($price))
@@ -1535,7 +2005,8 @@ sub init_windowitems {
                     hilight => $$q{hilight} || (($price <= $cash) ? "cyan" : "black"),
                   },
                 } grep {
-                  $asset{$buyitem}{unlocked}{buy}{$_} or $_ eq "cancel"
+                  $_ and
+                  (($_ eq "cancel") or $asset{$buyitem}{unlocked}{buy}{$_})
                 } @{$asset{$buyitem}{buyqtty} || [qw(1 12 144)]}, "cancel"),
                 (map {
                   +{ name => $_,
@@ -1783,7 +2254,7 @@ sub input_settings {
     # TODO: maybe suport option types other than enum/multiple-choice ?
     my ($i) = grep { $$_{key} eq $k } @item;
     if ($i) {
-      $opt{$$o{name}} = $$i{value};
+      $option{$$o{name}} = $$i{value};
       changed_color_depth() if $setting eq "colordepth";
       $setting = undef;
       $windowitem{settings} = [settings_items()];
@@ -1815,7 +2286,7 @@ sub doeggwidget {
   my ($w, $s, @more) = @_;
   $$w{bg} ||= "black";
   my %moropt = @more;
-  my $hbg = $opt{focusbgcolor} || $$w{focusbg} || "black";
+  my $hbg = $option{focusbgcolor} || $$w{focusbg} || "black";
   my $bg  = (($$w{id} eq $$wfocus{id}) ? $hbg : undef) ||
     ($$w{transparent} ? '__TRANSPARENT__' : $$w{bg}) ||
     '__TRANSPARENT__';
@@ -1959,7 +2430,7 @@ sub loadoptions {
 }
 
 sub saveoptions {
-  my $fn = $opt{optionsfile} || catfile(get_config_dir(), "eggs.cfg");
+  my $fn = $option{optionsfile} || catfile(get_config_dir(), "eggs.cfg");
   open OPT, ">", $fn or die "Cannot write options file '$fn': $!";
   print OPT "Eggs v" . $version . " Options File\n";
   for my $o (grep { $$_{save} =~ /user/ } @option) {
@@ -1975,13 +2446,13 @@ sub saveoptions {
 
 sub restoregame {
   my ($fn) = @_;
-  $fn ||= $opt{savefile} || catfile(get_config_dir(), "eggs.save");
+  $fn ||= $option{savefile} || catfile(get_config_dir(), "eggs.save");
   debuglog("Restoring $fn");
   if (open SAV, "<", $fn) {
     my %restored;
     while (<SAV>) {
       my $line = $_;
-      if ($line =~ /^\s*Global[:](Date|RunStarted|NGPETA)=(\d+)-(\d+)-(\d+)/) {
+      if ($line =~ /^\s*Global[:](Date|RunStarted|NGPETA|BirthDate)=(\d+)-(\d+)-(\d+)/) {
         my ($whichdate, $y, $m, $d) = ($1, $2, $3, $4);
         my $dt = DateTime->new( year  => $y,
                                 month => $m,
@@ -1994,6 +2465,8 @@ sub restoregame {
           $runstarted = $dt;
         } elsif ($whichdate eq "NGPETA") {
           $ngpeta = $dt;
+        } elsif ($whichdate eq "BirthDate") {
+          $birthdate = $dt;
         } else {
           die "Unknown date variable: '$whichdate'.";
         }
@@ -2002,7 +2475,7 @@ sub restoregame {
         $cash = $1;
         $restored{global}++;
       } elsif ($line =~ /^\s*Global[:]Lvl=(.*?)\w*$/) {
-        ($breedlvl, $genlvl, $genleak) = split /,/, $1;
+        ($breedlvl, $genlvl, $genleak, $gamephase) = split /,/, $1;
         $restored{global}++;
       } elsif ($line =~ /^\s*Mode[:](\w+)=(.*?)\s*$/) {
         my ($wst, $mode) = ($1, $2);
@@ -2052,7 +2525,7 @@ sub restoregame {
         }
       } elsif ($line =~ /^\s*Option[:]([^=]+)=(.*?)\s*$/) {
         my ($name, $value) = ($1, $2);
-        $opt{$name} = $value if defined $value;
+        $option{$name} = $value if defined $value;
         $restored{option}++;
       } elsif ($line = /^\s*Message[:]([^:]+)[:](.*)/) {
         my ($channel, $text) = ($1, $2);
@@ -2078,19 +2551,20 @@ sub restoregame {
 }
 
 sub savegame {
-  my $fn = $opt{savefile} || catfile(get_config_dir(), "eggs.save");
+  my $fn = $option{savefile} || catfile(get_config_dir(), "eggs.save");
   open SAV, ">", $fn or die "Cannot write to save game file '$fn': $!";
   print SAV "Eggs v" . $version . " Saved Game\n";
   print SAV qq[#### Globals\n];
   for my $d (["Date", $date],
              ["RunStarted", $runstarted],
              ["NGPETA", $ngpeta],
+             ["BirthDate", $birthdate],
             ) {
     my ($name, $dt) = @$d;
     print SAV "Global:" . $name . "=" . sprintf("%04d", $dt->year()) . "-" . sprintf("%02d", $dt->month()) . "-" . sprintf("%02d", $dt->mday()) . "\n";
   }
   print SAV qq[Global:Cash=] . $cash . " zorkmids\n";
-  print SAV qq[Global:Lvl=] . (join ",", map { 0 + $_ } ($breedlvl, $genlvl, $genleak)) . "\n";
+  print SAV qq[Global:Lvl=] . (join ",", map { 0 + $_ } ($breedlvl, $genlvl, $genleak, $gamephase)) . "\n";
   print SAV qq[#### Assets\n];
   for my $atype (sort { ($asset{$a}{sort} || $asset{$a}{value}) <=> ($asset{$b}{sort} || $asset{$b}{value}) } keys %asset) {
     my $unl = (ref $asset{$atype}{unlocked}{buy})
@@ -2119,7 +2593,7 @@ sub savegame {
   }
   print SAV qq[#### Options Section\n];
   for my $o (grep { $$_{save} =~ /game/ } @option) {
-    print SAV qq[Option:$$o{name}=$opt{$$o{name}}\n];
+    print SAV qq[Option:$$o{name}=$option{$$o{name}}\n];
   }
   print SAV qq[#### Messages Section\n];
   for my $m (@message) {
@@ -2154,8 +2628,8 @@ sub redraw {
 }
 
 sub draweggscreen {
-  drawscreen($screen, %opt);
-  ## if ($opt{nohome}) {
+  drawscreen($screen, %option);
+  ## if ($option{nohome}) {
   ##   print $reset . "\n\n";
   ## } else {
   ##   print chr(27) . "[H" . $reset;
@@ -2174,7 +2648,7 @@ sub draweggscreen {
   ##              . (length($$s[$x][$y]{char}) ? ($$s[$x][$y]{char} || " ") : " ")
   ##       unless (($x == $xmax) and
   ##               ($y == $ymax) and
-  ##               (not $opt{fullrect}));
+  ##               (not $option{fullrect}));
   ##     $lastbg = $$s[$x][$y]{bg} || "";
   ##     $lastfg = $$s[$x][$y]{fg} || "";
   ##   }
@@ -2199,19 +2673,19 @@ sub layout {
   $xmax ||= 80;
   $ymax ||= 24;
   #$xmax--; $ymax--; # Term::Size::chars returns counts, not zero-indexed maxima.  Sometimes.  It's complicated, and confusing, and might depend on the terminal.
-  $xmax = $opt{xmax} if $opt{xmax} and ($xmax > $opt{xmax});
-  $ymax = $opt{ymax} if $opt{ymax} and ($ymax > $opt{ymax});
+  $xmax = $option{xmax} if $option{xmax} and ($xmax > $option{xmax});
+  $ymax = $option{ymax} if $option{ymax} and ($ymax > $option{ymax});
   my $leftsize  = ($xmax > 100) ? int($xmax / 5) : 20;
   my $rightsize = ($xmax > 100) ? int($xmax / 5) : 20;
   my $msgheight = int($ymax / 2); # TODO: maybe adjust this.
   my $budgetheight = 12;
-  $wbg = +{ x => 1, y => 1, xmax => $xmax + 1, ymax => $ymax + 1,
-            type    => "diffuse",
-            fg      => "default",
-            bg      => "default",
-            id      => $wcount++,
-            preseed => 7,
-            redraw  => 1, };
+  $wbg ||= +{ x => 1, y => 1, xmax => $xmax + 1, ymax => $ymax + 1,
+              type    => "diffuse",
+              fg      => "default",
+              bg      => "default",
+              id      => $wcount++,
+              preseed => 7,
+              redraw  => 1, };
   #if ($ymax > 26) {
   #  $wrealclock = +{ type => "clock",
   #                   x => 0, y => $ymax - 5,
@@ -2288,7 +2762,7 @@ sub layout {
                 fg => "purple-red", focusbg => "purple", id => $wcount++, transparent => 1,
                 input => sub { input_budget(@_); },
               };
-  if ($opt{debug}) {
+  if ($option{debug}) {
     $wordkey = +{ type => "ordkey", title => "OrdKey F12", redraw => 1,
                   line1 => "Press Keys",
                   x => $leftsize, y => $msgheight, xmax => $leftsize + 12, ymax => $ymax,
@@ -2315,7 +2789,7 @@ sub layout {
                   transparent => 1,
                 };
   $wfocus ||= $wbuy;
-  $$wbg{disabled} = ($opt{colordepth} >= 24) ? 0 : 1;
+  $$wbg{disabled} = ($option{colordepth} >= 8) ? 0 : 1;
   @widget = grep { $_ and not $$_{disabled}
                  } ($wbg, $wtopbar, $wcashflow,
                     #$wgameclock, $wrealclock,
@@ -2324,6 +2798,14 @@ sub layout {
   for my $w (@widget) {
     $$w{contentsizex} ||= $$w{xmax} - $$w{x} - 2;
     $$w{contentsizey} ||= $$w{ymax} - $$w{y} - 2;
+  }
+}
+
+sub color_test {
+  push @message, ["Color Test: ", "meta"];
+  for my $fg (grep { not ($$_{name} =~ /^diffuse/) } @namedcolor) {
+    push @message, [$$fg{name}, $$fg{name}];
+    # TODO: and show that on various backgrounds.
   }
 }
 
@@ -2345,9 +2827,9 @@ sub layout {
 
 sub debuglog {
   my ($msg) = @_;
-  if ($opt{debug}) {
+  if ($option{debug}) {
     #open DEBUG, ">>", "debug.log";
-    #my $now = DateTime->now( time_zone => $opt{localtimezone} );
+    #my $now = DateTime->now( time_zone => $option{localtimezone} );
     #print DEBUG $msg . "\n";
     #close DEBUG;
     egggamelog($msg);
@@ -2356,8 +2838,12 @@ sub debuglog {
 
 sub isare {
   my ($num) = @_;
-  return "is" if $num == 1;
-  return "are";
+  return inflectverb($num, "is", "are");
+}
+sub inflectverb {
+  my ($num, $sgverb, $plverb) = @_;
+  return $sgverb if $num == 1;;
+  return $plverb;
 }
 
 sub sgorpl { # Singular or plural, depending on number.
@@ -2404,20 +2890,35 @@ sub shownum {
       $base = int($base + 4.999) / 10;
     }
     return $base . "e+0" . $exp; # scientific notation
-  } elsif ($n > 20 * 1000 * 1000 * 1000 * 1000 * 1000) {
+  } elsif ($n > 100 * 1000 * 1000 * 1000 * 1000 * 1000) {
     my $q = int(($n + 500 * 1000 * 1000 * 1000 * 1000) / (1000 * 1000 * 1000 * 1000 * 1000));
     return $q . "q"; # quadrillion
-  } elsif ($n > 20 * 1000 * 1000 * 1000 * 1000) {
+  } elsif ($n >  10 * 1000 * 1000 * 1000 * 1000 * 1000) {
+    my $q = int(($n + 500 * 1000 * 1000 * 1000 * 1000) / (100 * 1000 * 1000 * 1000 * 1000)) / 10;
+    return $q . "q"; # quadrillion
+  } elsif ($n > 100 * 1000 * 1000 * 1000 * 1000) {
     my $t = int(($n + 500 * 1000 * 1000 * 1000) / (1000 * 1000 * 1000 * 1000));
     return $t . "t"; # trillion
-  } elsif ($n > 20 * 1000 * 1000 * 1000) {
+  } elsif ($n >  10 * 1000 * 1000 * 1000 * 1000) {
+    my $t = int(($n + 500 * 1000 * 1000 * 1000) / (100 * 1000 * 1000 * 1000)) / 10;
+    return $t . "t"; # trillion
+  } elsif ($n > 100 * 1000 * 1000 * 1000) {
     my $b = int(($n + 500 * 1000 * 1000) / (1000 * 1000 * 1000));
     return $b . "b"; # billion
-  } elsif ($n > 20 * 1000 * 1000) {
+  } elsif ($n >  10 * 1000 * 1000 * 1000) {
+    my $b = int(($n + 500 * 1000 * 1000) / (100 * 1000 * 1000)) / 10;
+    return $b . "b"; # billion
+  } elsif ($n > 100 * 1000 * 1000) {
     my $m = int(($n + 500000) / (1000 * 1000));
     return $m . "m"; # million
-  } elsif ($n > 20 * 1000) {
+  } elsif ($n >  10 * 1000 * 1000) {
+    my $m = int(($n + 500000) / (100 * 1000)) / 10;
+    return $m . "m"; # million
+  } elsif ($n > 100 * 1000) {
     my $m = int(($n + 500) / 1000);
+    return $m . "k"; # k=thousand
+  } elsif ($n >  10 * 1000) {
+    my $m = int(($n + 500) / 100) / 10;
     return $m . "k"; # k=thousand
   } else {
     return $n;
