@@ -26,7 +26,7 @@ require "./paths.pl";
 require "./logging.pl";
 require "./widgets.pl";
 
-my $version = "0.3.0 alpha";
+my $version = "0.3.1 alpha";
 binmode(STDOUT, ":utf8");
 
 #################################################################################################
@@ -67,7 +67,7 @@ my @option = ( +{ short    => "-",
                               ],
                 },
                +{ name    => "autosave",
-                  default => "",
+                  default => "annually",
                   true    => "monthly",
                   desc    => "Automatically save your progress every so often.",
                   key     => "a",
@@ -155,6 +155,16 @@ my @option = ( +{ short    => "-",
                   default => "b",
                   save    => "game",
                 },
+               +{ name    => "sellbonds",
+                  desc    => "When to automatically sell off bonds to cover purchases.",
+                  key     => "b",
+                  enum    => [+{ key => "n", value => 0, name => "never",},
+                              +{ key => "m", value => 1, name => "mature bonds only",},
+                              +{ key => "a", value => 2, name => "always",},
+                             ],
+                  default => 1,
+                  save    => "game",
+                },
                +{ name    => "savefile",
                   default => catfile(get_config_dir(), "eggs.save"),
                   desc    => "Path and file name of the saved-game file.",
@@ -184,6 +194,12 @@ my @option = ( +{ short    => "-",
                +{ name    => "channelcolor_occasion",
                   desc    => "Color for messages about events that occur in the game's world.",
                   default => "yellow",
+                  save    => "user",
+                  enum    => [ @clropt ],
+                },
+               +{ name    => "channelcolor_stock",
+                  desc    => "Color for messages about the stock market.",
+                  default => "spring-green",
                   save    => "user",
                   enum    => [ @clropt ],
                 },
@@ -289,10 +305,15 @@ my @cmda = @ARGV; while (scalar @cmda) {
 #################################################################################################
 
 my ($wbg, $wtopbar, $wcashflow, $wmessages, $wassets, $wbudget, $wbuy, $wsettings,
-    $wgameclock, $wrealclock, $wordkey);
-my ($buyitem, $setting, $budgetitem, $debughint);
+    $wgameclock, $wrealclock, $wordkey, $wticker);
+my ($buyitem, $buystock, $setting, $budgetitem, $debughint);
 my ($breedlvl, $genlvl, $genleak, $gamephase) = (1, 1, 1, 1);
-my (@message, @messageline, @county, @extantplace);
+# 64-bit maxint is 9,223,372,036,854,775,807 and we don't want to get too close to that.
+# for comparison:    9223372036854775807;
+my $investcashover =  100000000000000000;
+my $defaultbondamt =   15000000000000000;
+
+my (@message, @messageline, @extantplace, @world, @nation, @province, @county);
 my @relative = (["favourite uncle",  "he",  "his"],
                 ["sainted aunt",     "she", "her"],
                 ["grandfather",      "he",  "his"],
@@ -316,18 +337,25 @@ if ($option{debug}) {
       sendtologfile($lf, $msg);
     }}}
 
+my @industry = stock_market_industries();
 my %cashflow;
 my %globalkeybinding = global_key_bindings();
 my $inputprefix = "";
-my $now  = DateTime->now( time_zone => $option{localtimezone} );
-my $date = DateTime->new( year  => 1970,
-                          month => 1,
-                          day   => 1,
-                          hour  => 6,
-                        );
-my ($cash, $runstarted, $ngpeta, $birthdate, $paused);
+my ($now, $date); eval {
+  $now  = DateTime->now( time_zone => ($option{localtimezone} || "UTC") );
+  $date = DateTime->new( year      => 1970,
+                         month     => 1,
+                         day       => 1,
+                         hour      => 6,
+                         time_zone => ($option{localtimezone} || "UTC"),
+                       );
+};
+croak "DateTime problems" if not ref $now;
+croak "DateTime problems" if not ref $date;
+my ($cash, $runstarted, $ngpeta, $birthdate, $paused, $primerate);
 $cash = 0;
-my (%buyqtty, %budget, %asset, %windowitem);
+$primerate = 2.5;
+my (%buyqtty, %budget, %asset, %windowitem, %stock, @bond);
 
 END { ReadMode 0; };
 ReadMode 3;
@@ -378,23 +406,67 @@ debuglog("Started game session " . $now->ymd() . " at " . $now->hms()) if $optio
                         pmult  => 1000,
                       },
              25000 => +{ id     => 25000,
-                         key    => "r",
+                         key    => "i",
                          name   => "25k",
                          number => 25000,
                          pmult  => 25000,
                        },
              250000 => +{ id     => 250000,
-                          key    => "q",
+                          key    => "j",
                           name   => "250k",
                           number => 250000,
                           pmult  => 250000,
                         },
              5000000 => +{ id     => 5000000,
-                           key    => "5",
+                           key    => "l",
                            name   => "5m",
                            number => 5000000,
                            pmult  => 5000000,
                          },
+             hundmil => +{ id     => "hundmil",
+                           key    => "m",
+                           name   => "100m",
+                           number => 100000000,
+                           pmult  => 100000000,
+                         },
+             billion => +{ id     => "billion",
+                           key    => "b",
+                           name   => "billion",
+                           number => 1000000000,
+                           pmult  => 1000000000,
+                         },
+             "25b"  => +{ id     => "25b",
+                          key    => "n",
+                          name   => "25 billion",
+                          number => 25000000000,
+                          pmult  => 25000000000,
+                        },
+             "250b" => +{ id     => "250b",
+                          key    => "p",
+                          name   => "250 billion",
+                          number => 250000000000,
+                          pmult  => 250000000000,
+                        },
+             # In asciibetical order, the decimal-based letter keys:
+             # a - asneeded
+             # b - billion
+             # c - cancel
+             # h - hundred (100)
+             # i - 25k (25 thousand)
+             # j - 250k (250 thousand)
+             # k - thousand (1000)
+             # l - 5 million
+             # m - hundred million
+             # n - 25b (25 billion)
+             # o - one (1)
+             # p - 250b (250 billion)
+             # q - quadrillion (not yet implemented)
+             # r - hundred trillion (not yet implemented)
+             # s - 5 trillion (not yet implemented)
+             # t - ten (10)
+             # u - 25 quadrillion (not yet implemented)
+             # v - 250 quadrillion (not yet implemented)
+             # w - 5 quintillion (not yet implemented)
              144 => +{ id     => 144,
                        key    => "g",
                        name   => "gross",
@@ -403,46 +475,92 @@ debuglog("Started game session " . $now->ymd() . " at " . $now->hms()) if $optio
                      },
              1728 => +{ id     => 1728,
                         key    => "l",
-                        name   => "lot",
+                        name   => "lot (great gross)",
                         number => 1728,
                         pmult  => 1000,
                       },
-             20736 => +{ id     => 20736,
-                         number => 20736,
-                         name   => "faireu",
-                         key    => "f",
-                         pmult  => 10000,
+             faireu => +{ id     => "faireu",
+                          number => 20736,
+                          name   => "faireu",
+                          key    => "f",
+                          pmult  => 10000,
                        },
-             248832 => +{ id     => 248832,
+             eaurie => +{ id     => "eaurie",
                           number => 248832,
                           name   => "eaurie",
                           key    => "e",
                           pmult  => 100000,
                         },
-             2985984 => +{ id     => 2985984,
-                           number => 2985984,
-                           name   => "passel",
-                           key    => "p",
-                           pmult  => 1000000,
-                         },
-             35831808 => +{ id     => 35831808,
-                            number => 35831808,
-                            name   => "clutch",
-                            key    => "h",
-                            pmult  => 10000000,
-                          },
-             429981696 => +{ id     => 429981696,
+             passel => +{ id     => "passel",
+                          number => 2985984,
+                          name   => "passel (greater gross)",
+                          key    => "p",
+                          pmult  => 1000000,
+                        },
+             clutch => +{ id     => "clutch",
+                          number => 35831808,
+                          name   => "clutch",
+                          key    => "h",
+                          pmult  => 10000000,
+                        },
+             batallion => +{ id     => "batallion",
                              number => 429981696,
                              name   => "batallion",
                              key    => "b",
                              pmult  => 100000000,
                            },
-             5159780352 => +{ id     => 5159780352,
-                              number => 5159780352,
-                              name   => "army",
-                              key    => "m",
-                              pmult  => 1000000000,
-                            },
+             army => +{ id     => "army",
+                        number => 5159780352,
+                        name   => "army",
+                        key    => "y",
+                        pmult  => 1000000000,
+                      },
+             myriad => +{ id     => "myriad",
+                          number => 743008370688,
+                          name   => "myriad",
+                          key    => "m",
+                          pmult  => 100000000000,
+                        },
+             # Man, it's a good thing nobody uses 32-bit systems any more.  I think I want a 256-bit system.
+             klatch => +{ id     => "klatch",
+                          number => 106993205379072,
+                          name   => "klatch",
+                          key    => "k",
+                          pmult  => 100000000000000,
+                        },
+             #jankette => +{ id     => "jankette",
+             #               number => 15407021574586368,
+             #               name   => "jankette",
+             #               key    => "j",
+             #               pmult  => 10000000000000000,
+             #             },
+             # In alphabetical order, the dozen-based letters:
+             # a - asneeded
+             # b - batallion (12 clutches)
+             # c - cancel
+             # d - dozen
+             # e - eaurie (12 faireu)
+             # f - faireu (12 lots)
+             # g - gross (12 dozen)
+             # h - clutch (12 passels)
+             # i -
+             # j - jankette (144 klatches)
+             # k - klatch (144 myriad)
+             # l - lot (12 gross)
+             # m - myriad (144 armies)
+             # n -
+             # o - one (1)
+             # p - passel (12 eaurie)
+             # q -
+             # r -
+             # s -
+             # t - too many
+             # u -
+             # v -
+             # w -
+             # x -
+             # y - army (12 batallions)
+             # z -
              feedbag => +{ id     => "feedbag",
                            key    => "b",
                            name   => "bag",
@@ -491,6 +609,34 @@ debuglog("Started game session " . $now->ymd() . " at " . $now->hms()) if $optio
                           fg         => "yellow",
                           unlockqtty => "0 but true",
                         },
+             countylicense => +{ id        => "countylicense",
+                                 key       => "a",
+                                 name      => "county",
+                                 placetype => \@county,
+                                 generate  => sub { generate_county(@_), },
+                                 value     => 125000000,
+                               },
+             provincelicense => +{ id        => "provincelicense",
+                                   key       => "p",
+                                   name      => "province",
+                                   placetype => \@province,
+                                   generate  => sub { generate_province(@_), },
+                                   value     => 2500000000,
+                                 },
+             nationlicense => +{ id        => "nationlicense",
+                                 key       => "n",
+                                 name      => "nation",
+                                 placetype => \@nation,
+                                 generate  => sub { generate_nation(@_), },
+                                 value     => 250000000000,
+                               },
+             worldlicense => +{ id        => "worldlicense",
+                                key       => "w",
+                                name      => "world",
+                                placetype => \@world,
+                                generate  => sub { generate_world(@_), },
+                                value     => 25000000000000000,
+                              },
            );
 my @pctopt = map { my ($pct, $key) = @$_;
                    +{ name  => $pct . '%',
@@ -562,8 +708,14 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          },
             # TODO:
             #  * Lobbyists, who promote friendly legislation to increase prices on eggs and chicken meat.
-            #  * Stocks, with auto-invest option for when cash gets large, auto-sell as needed for purchases.
+            #  * Auto-invest option for when cash gets large, with auto-divesting as needed for purchases.
           );
+my @bythedozen = (qw(1 12 144 1728 faireu eaurie passel clutch batallion
+                     army myriad klatch)); # jankette disabled for now; we will push the player
+                                           # toward phase 2 instead.
+my @bytens = (qw(1 10 100 1000 25000 250000 5000000 hundmil billion 25b 250b));
+my @licensetype = (qw(countylicense provincelicense nationlicense worldlicense cancel));
+
 %asset   =  ( egg => +{ id     => "egg",
                         name   => "egg",
                         plural => "eggs",
@@ -638,7 +790,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                           sort    => 100,
                           (map { $_ => 1 } qw(product good chicken)),
                           housein  => "nursery",
-                          buyqtty  => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352)],
+                          buyqtty  => [@bythedozen],
                           unlocked => +{ buy => +{ 1 => 1, }, },
                           lifespan => +{ months => 7, }, # includes time to hatch;
                           # at EOL, a chick may grow up into a hen (or a rooster); this is handled by expire_asset()
@@ -653,7 +805,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                         sort         => 101,
                         (map { $_ => 1 } qw(product good chicken)),
                         housein      => "coop",
-                        buyqtty      => [qw(1 12 144 1728 20736 248832 35831808 429981696 5159780352)],
+                        buyqtty      => [@bythedozen],
                         unlocked     => +{ buy => +{ 1 => 1, }, },
                         lifespan     => +{ years => 8 },
                         needvitamins => "1970-01-31",
@@ -668,7 +820,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                             sort       => 102,
                             (map { $_ => 1 } qw(product good chicken)),
                             housein    => "coop",
-                            buyqtty    => [qw(1 12 144 1728 20736 248832 35831808 429981696 5159780352)],
+                            buyqtty    => [@bythedozen],
                             unlocked   => +{ buy => +{ 1 => 1, }, },
                             lifespan   => +{ years => 8 },
                           },
@@ -681,6 +833,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                                 sort     => 200,
                                 (map { $_ => 1 } qw(supply good)),
                                 buyqtty  => [qw(feedbag feedpallet feedtruck feedwarehouse asneeded_feed)],
+                                # That's a short list of quantities because after a certain point, you buy feed factories instead.
                                 unlocked => +{ buy => +{ feedbag => 1, }, },
                               },
               vitamins => +{ id         => "vitamins",
@@ -691,13 +844,14 @@ my @pctopt = map { my ($pct, $key) = @$_;
                              value      => 10, # That's an adult dose, per month; chicks use less.
                              sort       => 250,
                              (map { $_ => 1 } qw(supply good)),
-                             buyqtty    => [qw(dose dozendoses 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                             buyqtty    => [qw(dose dozendoses 144 1728 faireu eaurie passel clutch batallion army
+                                               myriad klatch jankette asneeded)],
                            },
               carton => +{ id      => "carton",
                            name    => "egg carton",
                            desc    => "Customers will pay more for your eggs if they are nicely packaged.  Holds one dozen.",
                            assetfg => "white",
-                           buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                           buyqtty => [@bythedozen, "asneeded"],
                            value   => 1,
                            sort    => 300,
                            (map { $_ => 1 } qw(good supply packaging)),
@@ -708,7 +862,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          desc    => "Stores will pay more for your eggs if they are neatly packaged.  Holds 12 cartons.",
                          value   => 5,
                          sort    => 301,
-                         buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                         buyqtty => [@bythedozen, "asneeded"],
                          (map { $_ => 1 } qw(good supply packaging)),
                        },
               emptybag => +{ id      => "emptybag",
@@ -718,7 +872,8 @@ my @pctopt = map { my ($pct, $key) = @$_;
                              desc    => "Chicken feed is sold in bags.",
                              value   => 1,
                              sort    => 302,
-                             buyqtty => [qw(144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                             buyqtty => [qw(144 1728 faireu eaurie passel clutch batallion army
+                                            myriad klatch jankette asneeded)],
                            },
               emptypallet => +{ id      => "emptypallet",
                                 name    => "pallet",
@@ -726,7 +881,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                                 desc    => "Stores will pay more for your product if it is nicely palleted up for delivery.  Holds 45 cases or 25 large bags.",
                                 value   => 100,
                                 sort    => 305,
-                                buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                                buyqtty => [@bythedozen, "asneeded"],
                                 (map { $_ => 1 } qw(good supply packaging)),
                               },
               emptycontainer => +{ id      => "emptycontainer",
@@ -735,7 +890,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                                    value   => 20000,
                                    sort    => 306,
                                    assetfg => "grey",
-                                   buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                                   buyqtty => [@bythedozen, "asneeded"],
                                    (map { $_ => 1 } qw(good supply packaging)),
                                  },
               emptyfreighter => +{ id      => "emptyfreighter",
@@ -744,7 +899,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                                    sort    => 307,
                                    assetfg => "grey",
                                    value   => 120000000,
-                                   buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                                   buyqtty => [@bythedozen, "asneeded"],
                                    (map { $_ => 1 } qw(good supply packaging)),
                                  },
               emptypod => +{ id      => "emptypod",
@@ -753,7 +908,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                              assetfg => "grey",
                              sort    => 308,
                              value   => 200000000000,
-                             buyqtty => [qw(1 12 144 1728 20736 248832 2985984 35831808 429981696 5159780352 asneeded)],
+                             buyqtty => [@bythedozen, "asneeded"],
                              (map { $_ => 1 } qw(good supply packaging)),
                            },
               coop => +{ id       => "coop",
@@ -764,7 +919,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          landsize => 300,
                          sort     => 550,
                          assetfg  => "brown",
-                         buyqtty  => [qw(1 10 100 1000 25000 250000 5000000 asneeded)],
+                         buyqtty  => [@bytens, "asneeded"],
                          (map { $_ => 1 } qw(good housing)),
                        },
               nursery => +{ id        => "nursery",
@@ -775,7 +930,7 @@ my @pctopt = map { my ($pct, $key) = @$_;
                             landsize  => 10,
                             value     => 15000,
                             assetfg   => "brown",
-                            buyqtty   => [qw(1 10 100 1000 25000 250000 5000000 asneeded)],
+                            buyqtty  => [@bytens, "asneeded"],
                             (map { $_ => 1 } qw(good housing)),
                           },
               acre => +{ id       => "acre",
@@ -785,13 +940,14 @@ my @pctopt = map { my ($pct, $key) = @$_;
                          value    => 5000000,
                          sort     => 700,
                          assetfg  => "green",
-                         buyqtty  => [qw(1 10 100 1000 25000 250000 5000000 asneeded)],
+                         buyqtty  => [@bytens, "asneeded"],
                          (map { $_ => 1 } qw(good housing)),
                          # An acre is nominally 43560 square feet, but you can't actually use quite 100%
                          # of that in practice, because among other things you can't build right at the
                          # edge, and you need paths between the buildings.  For simplicity, we'll say
                          # that an acre can support forty thousand square feet of buildings.
                          capacity => 40000,
+                         licenseneeded => "county",
                        },
               ffactory => +{ unlocked => +{ buy => +{ }},
                              unlcrit  => +{ chick   => 100000000,
@@ -803,9 +959,9 @@ my @pctopt = map { my ($pct, $key) = @$_;
                              desc     => "Produces chicken feed.",
                              (map { $_ => 1 } qw(good)),
                              assetfg  => "azure",
-                             value    => 20000000,
+                             value    => 50000000,
                              output   => +{ chickenfeed => 200000, },
-                             buyqtty  => [qw(1 10 100 1000 25000 250000)],
+                             buyqtty  => [@bytens, "asneeded"],
                              landsize => 200000, # five acres
                              sort     => 800,
                            },
@@ -855,6 +1011,13 @@ my @pctopt = map { my ($pct, $key) = @$_;
                             value  => 300000000000,
                             retail => 475000000000,
                           },
+              license => +{ id      => "license",
+                            name    => "business license",
+                            plural  => "business licenses",
+                            desc    => "Businesses must be licensed in each jurisdiction where they do business.",
+                            value   => $buyqtty{countylicense}{value},
+                            buyqtty => [@licensetype],
+                          },
               # TODO:
               #  * Licenses that allow you to operate in more jurisdictions, increasing the # of acres you can own.  County license, state license, national license, global license, system license, sector license, galaxy license, ...
               #  *
@@ -886,6 +1049,7 @@ if (-e ($option{savefile} || catfile(get_config_dir(), "eggs.save"))) {
   ngp();
 }
 push @message, ["Press F1 for help.", "help"];
+#push @message, ["Cash in excess of " . shownum($investcashover) . " will be automatically invested.", "debug"];
 refreshscreen();
 
 #################################################################################################
@@ -933,6 +1097,10 @@ exit 0; # Can't Happen
 #################################################################################################
 
 sub ngp {
+  generate_world() if not @world;
+  generate_nation() if not @nation;
+  generate_province() if not @province;
+  generate_county() if not @county;
   my $relative = $relative[0]; @relative = randomorder(@relative);
   #use Data::Dumper; print Dumper(+{ "relatives" => \@relative, chosen_relative => $relative, });
   my ($noun, $pronoun, $possessive) = @$relative;
@@ -945,8 +1113,6 @@ sub ngp {
   if ($fact > 10) {
     debuglog("Factory Phase, Activate.");
     $gamephase = 2 if $gamephase < 2;
-    # TODO: if keeping a good number of factories, move into a
-    #       phase of the game wherein you sell excess chicken feed.
   }
   while (((($coop * 2 * $asset{coop}{landsize})
            + ($nurs * 2 * $asset{nursery}{landsize})
@@ -957,24 +1123,51 @@ sub ngp {
     $acre++;
   }
   $acre ||= 1;
-  # TODO: enough licenses to cover the acreage.
+  # Most of your late benefactor's land goes back on the market:
+  for my $c (@county) {
+    $$c{available_land} += $$c{owned_land};
+    $$c{owned_land} = 0;
+  }
+  # You don't inherit the business licenses:
+  for my $j (@county, @province, @nation, @world) {
+    $$j{licensed} = 0;
+  }
+  # Start the player with licenses to operate in one county with a pretty standard land cost:
+  $county[0]{licensed} = $province[0]{licensed} = $nation[0]{licensed} = $world[0]{licensed} = 1;
+  $county[0]{landcost} = $asset{acre}{value};
+  # For gameplay reasons, we must ensure that there is enough land in the remaining licensed county
+  # for the player to get "off the ground".  (Gameplay is more important than realism.)  The excuse,
+  # from a story perspective, can be that some of the land that was not left to you in the will,
+  # becomes available for purchase due to being on the market:
+  $county[0]{available_land} += $county[0]{owned_land} - $acre;
+  $county[0]{owned_land} = $acre;
+  if ($county[0]{avaliable_land} <= $acre) {
+    # Need some room to grow.  So, this county, umm, just merged with an adjacent one, or something:
+    $county[0]{avaliable_land} += $acre;
+    $county[0]{size} = $county[0]{owned_land} + $county[0]{avaliable_land}
+      + 1; # enough room for the county courthouse and sherrif's office.
+  }
+  my ($c) = $county[0];
   @message  = (["So there you are, penniless and fresh out of school, wondering what you're going to do now, and it seems your $noun has just died; and $pronoun left you "
-                . (($acre == 1) ? "an acre" : shownum($acre) . " acres") . " of land, with "
+                . (($acre == 1) ? "an acre" : shownum($acre) . " acres") . " of land near $$c{capital}, the $$c{capitalword} of $$c{name}, with "
                 . ((($fact >= 1) ? (($fact == 1)
                                     ? "a chicken-feed factory "
                                     : shownum($fact) . " chicken-feed factories, ")
                     : ""))
                 . ((($coop == 1) ? "a chicken coop" : (shownum($coop)) . " chicken coops"))
-                . " on it, and $possessive best laying hen.  ", "story"]);
+                . " on it, and $possessive best laying hen.", "story"]);
   @messageline = ();
   rewrap_message_log($wmessages);
   %cashflow = map { $_ => +{} } qw(current lastmonth year lastyear total);
   $cash = 0;
   $runstarted = $date;
-  $ngpeta     = $runstarted->clone()->add(years => (40 + int rand 40),
+  $ngpeta     = $runstarted->clone()->add(years => (40 + int rand rand 55),
                                           days  => (1 + int rand 365));
   $birthdate  = $runstarted->clone()->subtract( years  => (19 + int rand 6),
                                                 days   => (1 + int rand 365), );
+  for my $symbol (keys %stock) {
+    $stock{$symbol}{owned} = 0;
+  }
 
   my %keepasneeded = map { $_ => 1 } qw(chickenfeed
                                         carton case emptypallet emptycontainer emptyfreighter emptypod
@@ -996,7 +1189,6 @@ sub ngp {
   addasset("nursery", $nurs);
   addasset("acre", $acre);
   addasset("ffactory", $fact);
-  # TODO: licenses and such
   if ($option{pauseonngp}) {
     toggle_pause("force_pause_on");
   }
@@ -1026,11 +1218,29 @@ sub iterate {
       unlink $option{savefile} unless $option{debug};
       exit 0;
     }
+    push @message, ["Your will calls for your best prize laying hen to be left to your heir...", "story"];
     ngp();
-  } elsif (($birthdate->month() eq $date->month()) and
+  } elsif ((ref $birthdate) and # for backward compatibility with old game files
+           ($birthdate->month() eq $date->month()) and
            ($birthdate->mday() eq $date->mday())) {
     my $age = int($date->year() - $birthdate->year());
     push @message, [qq[Happy Birthday!  You are now $age years old.], "occasion"];
+  }
+  for my $sym (keys %stock) {
+    # TODO: update the indicators, model the economy, etc.
+    my $mvt = (($$wticker{rotate_counter} % 3) ? $stock{$sym}{movement} : (((int rand 100) - 45) / 10));
+    $stock{$sym}{price} += $mvt;
+    $stock{$sym}{movement} = $mvt;
+    if ($stock{$sym}{price} < 50) {
+      push @message, [$stock{$sym}{name} . " ($sym) delisted.", "stock"];
+      $stock{$sym} = undef;
+    } elsif (($stock{$sym}{price} > 50000000) and ($mvt > 5) and (20 > rand 100)) {
+      my $multiplier = int($stock{$sym}{price} / 50000000);
+      $stock{$sym}{shares} *= $multiplier;
+      $stock{$sym}{owned}  *= $multiplier;
+      $stock{$sym}{price}   = $stock{$sym}{price} / $multiplier;
+      push @message, [$stock{$sym}{name} . " ($sym) splits, " . $multiplier . "-for-1.", "stock"];
+    }
   }
   for my $producer (grep { ($asset{$_}{qtty} > 0) and (ref $asset{$_}{output}) } keys %asset) {
     # Assets that produce other assets, for now, is just feed factories making chicken feed.
@@ -1044,7 +1254,7 @@ sub iterate {
       #                . " " . inflectverb($asset{$producer}{qtty}, "produces", "produce")
       #                . " " . shownum($asset{$producer}{output}{$product}  * $asset{$producer}{qtty}) . " "
       #                . sgorpl($asset{$producer}{output}{$product} * $asset{$producer}{qtty}, ($asset{$product}{name} || $product), $asset{$product}{plural})
-      #                . ". ", "assetgain"];
+      #                . ".", "assetgain"];
     }}
   for my $lockedproducer (grep { (ref $asset{$_}{output}) and
                                    not $asset{$_}{unlocked}{buy}{$asset{$_}{buyqtty}[0]}
@@ -1078,6 +1288,7 @@ sub iterate {
   if ($date->mday() == 1) {
     update_levels();
     monthly_expenses();
+    adjust_primerate();
     savegame() if $option{autosave} eq "monthly";
     if ($option{debug}) {
       use Data::Dumper;
@@ -1096,6 +1307,20 @@ sub iterate {
       $cashflow{sc}{year} = +{};
       savegame() if $option{autosave} eq "annually";
     }
+  }
+  if (10 > int rand 4000) {
+    # We add new stocks from time to time starting from the very beginning, so that by the time the
+    # player unlocks the stock-market feature, there will be a pool of existing stocks.  We don't
+    # need to expend computational cycles on stock _activity_ until that happens, but there need to
+    # be some stocks created.
+    my $ns = newstock();
+    $stock{$$ns{symbol}} = $ns;
+    # The following message is temporary, for debugging purposes.
+    push @message, ["$$ns{name} goes public, ticker symbol $$ns{symbol}, "
+                    . shownum($$ns{shares}) . " shares at " . shownum($$ns{price})
+                    . ", indicators: " . shownum($$ns{sales}) . ", " . shownum($$ns{assets})
+                    . ", +" . shownum($$ns{cash}) . ", -" . shownum($$ns{debt}) . ".", "stock"]
+      if $gamephase >= 2;
   }
   my $mealsneeded = $days * int($asset{hen}{qtty} + $asset{rooster}{qtty} + (($asset{chick}{qtty} + 3) / 7));
   $asset{chickenfeed}{qtty} -= $mealsneeded;
@@ -1338,7 +1563,7 @@ sub expire_asset {
       addasset("hen", 1); # Don't let the player's last laying hen die of old age.
     }
     my $died = $ustahav - $asset{$atype}{qtty};
-    push @message, [$died . " " . sgorpl($died, $asset{$atype}{name},
+    push @message, [shownum($died) . " " . sgorpl($died, $asset{$atype}{name},
                                          $asset{$atype}{plural}) . " died.", "assetloss"]
       if $died > 0;
   } else {
@@ -1374,16 +1599,42 @@ sub chicken_health_ev {
   return $ev;
 }
 
+sub parseisodate {
+  my ($d) = @_;
+  my ($y, $m, $day) = $d =~ /(\d{4})-(\d+)-(\d+)/;
+  croak "parsedate(): failed to parse, '$d'" if not $day;
+  my $tz = $option{localtimezone} || "UTC";
+  my $dt;
+  eval {
+    $dt = DateTime->new( year      => $y,
+                         month     => $m,
+                         day       => $day,
+                         time_zone => $tz,
+                       );
+  };
+  croak "DateTime failure: $d" if not ref $dt;
+  return $dt;
+}
+
 sub chicken_health_modifiers {
   my ($ctype, $reason) = @_;
   my ($lastexamdate) = $asset{$ctype}{examined} || "1970-01-01";
-  my $monthssincelastexam = 0;
-  my $dt = $date->clone();
-  # TODO: This is O(n).  Replace it with an O(1) formula.
-  while ($dt->ymd() ge $lastexamdate) {
-    $dt = $dt->subtract( months => 1 );
-    $monthssincelastexam++;
-  }
+  my $dt;
+  my $sincelastexam; eval {
+    my $current = $date->clone();
+    $dt = parseisodate($lastexamdate);
+    $sincelastexam = $current->subtract_datetime($dt);
+  };
+  croak "chicken_health_modifiers: problems with last exam date '$lastexamdate' => " . $dt->ymd()
+    . "\n" . $@ if not ref $sincelastexam;
+  my $monthssincelastexam = ($sincelastexam->years() * 12) + $sincelastexam->months()
+    + ($sincelastexam->days() ? 1 : 0);
+  ## my $dt = $date->clone();
+  ## # TODO: This is O(n).  Replace it with an O(1) formula.
+  ## while ($dt->ymd() ge $lastexamdate) {
+  ##   $dt = $dt->subtract( months => 1 );
+  ##   $monthssincelastexam++;
+  ## }
   my %mod = ( vitamins => (($asset{$ctype}{needvitamins} ge $date->ymd())
                            ? 1.1
                            : 1),
@@ -1398,6 +1649,81 @@ sub chicken_health_modifiers {
   return %mod;
 }
 
+sub licensedfor {
+  my ($neededfor, $number) = @_;
+  #warn qq[licensedfor($neededfor, $number)\n];
+  my (@c) = grep { $$_{available_land} and $$_{licensed} } @county;
+  #warn qq[There are ] . @c . " licensed counties with available land.";
+  my $total = 0;
+  my $cost  = 0;
+  my @usefrom;
+  for my $county (@c) {
+    $total += $$county{available_land};
+    #warn qq[ * $$county{name}, $$county{available_land} acres, running total = $total\n];
+    push @usefrom, $county;
+    if ($total >= $number) {
+      #warn qq[ That's enough.  Purchasing acreage...\n];
+      $total = 0;
+      for my $uf (@usefrom) {
+        my $use = $number - $total;
+        $use = $$uf{available_land} if $$uf{available_land} < $use;
+        $$uf{available_land} -= $use;
+        $$uf{owned_land}     += $use;
+        $total += $use;
+        $cost  += $use * $$uf{landcost};
+        #warn qq[ * $use acres from $$uf{name} for ] . ($use * $$uf{landcost}) . qq[\n];
+        expendcash($cost, "land", $$uf{name});
+      }
+      #warn qq[ Total cost: $cost\n];
+      return $total;
+    }
+  }
+  # TODO: add an option to turn auto-license-buying off.
+  return buylicensesfor($neededfor, $number - $total);
+}
+
+sub buylicensesfor {
+  my ($neededfor, $numacres) = @_;
+  my (@cl);
+  while ($numacres) {
+    my %lc;
+    my ($c) = generate_county();
+    my @jurisdiction;
+    my $lcost = 0;
+    if (not $$c{licensed}) {
+      $lcost += $lc{county} = $buyqtty{countylicense}{value};
+      push @jurisdiction, $$c{name};
+    }
+    my ($p) = grep { $$_{name} eq $$c{parent} } @province;
+    if (not $$p{licensed}) {
+      $lcost += $lc{provincial} = $buyqtty{provincelicense}{value};
+      push @jurisdiction, $$p{name};
+    }
+    my ($n) = grep { $$_{name} eq $$p{parent} } @nation;
+    if (not $$n{licensed}) {
+      $lcost += $lc{national} = $buyqtty{nationlicense}{value};
+      push @jurisdiction, $$n{name};
+    }
+    my ($w) = grep { $$_{name} eq $$n{parent} } @world;
+    if (not $$w{licensed}) {
+      $lcost += $lc{global} = $buyqtty{worldlicense}{value};
+    }
+    if (canafford($lcost)) {
+      for my $j (qw(county provincial national global)) {
+        expendcash($lcost, "licenses", $lc{$j}) if $lc{$j};
+      }
+      $$c{licensed} = $$p{licensed} = $$n{licensed} = $$w{licensed} = 1;
+      $numacres -= $$c{available_land};
+      push @cl, $$c{name};
+      return @cl if $numacres <= 0;
+    } else {
+      push @message, [qq[You can't afford the business licenses for ] . commalist(@jurisdiction) . ".",
+                      "actioncancel"];
+      return;
+    }
+  }
+}
+
 sub safetobuy {
   my ($atype, $number) = @_;
   debuglog("safetobuy($atype, $number);");
@@ -1409,7 +1735,9 @@ sub safetobuy {
   } elsif ($asset{$atype}{landsize}) {
     debuglog(" stb: returning canbuild($number, $atype)");
     return canbuild($number, $atype);
-  } # TODO: licenses and such will have other criteria.
+  } elsif ($asset{$atype}{licenseneeded}) {
+    return licensedfor($atype, $number);
+  }
   debuglog(" stb: returning $number");
   return $number;
 }
@@ -1426,10 +1754,15 @@ sub canhouse {
   my $left = $capacity - (($housingtype eq "nursery") ? $asset{chick}{qtty} : ($asset{hen}{qtty} + $asset{rooster}{qtty}));
   my $needed = 0;
   debuglog(" ch: n=$n; ht=$housingtype; cap=$capacity; left=$left; needed=$needed");
-  while ($left < $n) {
-    # TODO: This takes O(n) time; write an O(1) formula for it.
-    $needed++; $left += $asset{$housingtype}{capacity};
-  }
+  ## while ($left < $n) {
+  ##   # TODO: This takes O(n) time; write an O(1) formula for it.
+  ##   $needed++; $left += $asset{$housingtype}{capacity};
+  ## }
+  if ($left < $n) { # This should be faster.
+    $needed = ($n - $left) / $asset{$housingtype}{capacity};
+    if ($needed ne int $needed) {
+      $needed = int($needed + 1);
+    }}
   debuglog(" ch: n=$n; ht=$housingtype; cap=$capacity; left=$left; needed=$needed");
   # Simple case: if we already have the capacity, we're good:
   if ($needed == 0) {
@@ -1439,7 +1772,7 @@ sub canhouse {
   # Failing that, can we autobuy the housing?
   my $value = $asset{$housingtype}{value} * $needed;
   debuglog(" ch: value=$value (and cash=$cash)");
-  return if ($value > $cash); # Cannot afford.
+  return if (not canafford($value)); # Cannot afford.
   if (not $asset{$housingtype}{asneeded}) {
     debuglog(" ch: cannot buy as needed");
     # We aren't buying as-needed, but make sure buying is unlocked:
@@ -1453,7 +1786,7 @@ sub canhouse {
   }
   if (canbuild($needed, $housingtype)) {
     debuglog(" ch: cb sez ok, rechecking cash ($cash) against value ($value)");
-    return if $value > $cash; # In case buying the housing used up our funding.
+    return if not canafford($value); # In case buying the housing used up our funding.
     debuglog(" ch: building $needed $housingtype");
     buyasset($housingtype, $needed, $value, "canhouse");
     debuglog(" ch: returning $n");
@@ -1462,6 +1795,38 @@ sub canhouse {
     debuglog(" ch: cb sez no.");
     return;
   }
+}
+
+sub canafford {
+  my ($cost) = @_;
+  return $cost if $cost < $cash;
+  $cash -= $cost; # temporary, so bond sales don't trigger replacement bond purchases.
+  for my $b (@bond) {
+    if ($$b{mature}->ymd() lt $date->ymd()) {
+      # Bond is mature.  Go ahead and sell it.
+      sellbond($b);
+      if ($cash >= 0) {
+        $cash += $cost; # Restore what we took away,
+        return $cash;   # and let the purchase proceed.
+      }}}
+  # If we get here, we can't cover the cost unless we sell bonds that aren't mature.
+  if ($option{sellbonds} < 2) {
+    $cash += $cost; # Restore what we took away,
+    return;         # but the purchase cannot proceed.
+  }
+  for my $b (reverse @bond) {
+    # reverse order means we sell the ones that are *not* about to mature, so that we don't lose all
+    # our progress toward bond maturity every time we slightly overshoot our cash in hand.
+    sellbond($b);
+    if ($cash >= 0) {
+      $cash += $cost; # Restore what we took away,
+      return $cash;   # and let the purchase proceed.
+    }}
+  # We can't cover the purchase with sales of bonds that we own.
+  # TODO: allow other financing methods, such as issuing bonds,
+  #       if the player's credit rating is good enough.
+  $cash += $cost; # Restore what we took away,
+  return;         # but the purchase cannot proceed.
 }
 
 sub canbuild {
@@ -1483,7 +1848,7 @@ sub canbuild {
     $acresneeded++;
   }
   my $value = $acresneeded * $asset{acre}{value};
-  return if $cash < $value;
+  return if not canafford($value);
   if (not $asset{acre}{asneeded}) {
     # We aren't buying land as needed, but ensure buying it is unlocked:
     if (not $asset{acre}{unlocked}{buy}{1}) {
@@ -1528,7 +1893,7 @@ sub buyatleast { # If adequate funds are available, that is.
       if ($n * $buyqtty{$q}{number} < $stillneed) { $n++; }
       my $price = $n * $buyqtty{$q}{pmult} * $asset{$atype}{value};
       debuglog(" bal: q=$q; n=$n; p=$price; c=$cash");
-      if ($price < $cash) {
+      if (canafford($price)) {
         debuglog(" bal: attempting to buy " . ($n * $buyqtty{$q}{number}) . ".");
         buyasset($atype, $n * $buyqtty{$q}{number}, $price, $blame);
         $purchased += $n * $buyqtty{$q}{number};
@@ -1545,7 +1910,7 @@ sub buyatleast { # If adequate funds are available, that is.
 sub buyasset {
   my ($item, $number, $value, $blame) = @_;
   debuglog("buyasset($item, $number, $value);");
-  return if ($value > $cash);
+  return if not canafford($value);
   expendcash($value, (($blame eq "need") ? "essentials" : "purchases"),
              $asset{$item}{plural} || makeplural($asset{$item}{name}));
   addasset($item, $number);
@@ -1590,30 +1955,272 @@ sub trackage {
   }
 }
 
+sub generate_world {
+  my ($parent) = @_;
+  #warn qq[generate_world()\n];
+  # TODO: even larger jurisdictions?
+  my ($extant) = grep { not $$_{licensed} } @world;
+  return $extant if $extant;
+  my $parent ||= undef;
+  my $name; while ((not $name) or grep { lc($$_{name}) eq lc($name) } @extantplace) {
+    $name = ucfirst randomplaceword();
+    if (25 > rand 100) {
+      $name = join " ", $name, randomplaceword();
+    }}
+  my $capital = generate_placename(city_prefix(), city_suffix());
+  #warn qq[World will be $name, global capital will be $capital\n];
+  push @extantplace, +{ type   => "municipality",
+                        name   => $capital,
+                        parent => $name,
+                      };
+  push @extantplace, +{ type   => "world",
+                        name   => $name,
+                        parent => $parent,
+                      };
+  my $w = +{ size        => 1 + int rand 1000, # number of nations in this world
+             nations     => 0, # number generated so far
+             name        => $name,
+             capital     => $capital,
+             capitalword => "Global Capital",
+             parent      => $parent,
+           };
+  push @world, $w;
+  #warn qq[There are now ] . @world . qq[ worlds in the known universe.\n];
+  return $w;
+}
+
+sub generate_nation_name {
+  my $basename = undef;
+  while ((not defined $basename) or
+         grep { lc($$_{name}) eq lc($basename) } @extantplace) {
+    $basename = join ((95 > rand 100) ? " " : " and "),
+      map { ucfirst randomplaceword() } 1 .. (1 + int rand rand 3);
+  }
+  $basename ||= ucfirst randomplaceword();
+  if (6 > rand 100) {
+    return $basename;
+  } elsif (17 > rand 100) {
+    my @basemod = ((("the") x 10),
+                   "Greater", "Lesser", "Middle", "Upper", "Lower",
+                   "North", "South", "East", "West",
+                   "Northern", "Southern", "Eastern", "Western", "Central",
+                  );
+    # TODO: at low probability, randomword + -ese or -ite or -ic or whatnot, as in
+    #       Islamic Republic, Hashemite Kingdom, etc.
+    $basename = join " ", ($basemod[rand @basemod], $basename);
+    if (5 > rand 100) {
+      return ucfirst $basename;
+    }}
+  my @modifier = ("People's", "United", ((50 > rand 100) ? "Free" : "Grand"), "Democratic",
+                  "National", ((65 > rand 100) ? "Federal" : "Federated"),
+                  "Representative",
+                  "Socialist");
+  my @type = (((("Republic") x 30),
+               (("Commonwealth") x 5),
+               (("Principality") x 5),
+               (("Union") x 5),
+               (("Kingdom") x 4),
+               (("Federation") x 4),
+               (("Confederacy") x 3),
+               (("Confederation") x 3),
+               (("Nation") x 3),
+               (("Domain") x 2),
+               (("State") x 2),
+               "Alliance", "Association", "Coalition", "Society", "Syndicate", "Dominion",
+               "Empire", "Sovereignty", "Suzerainty", "Emirate", "Realm", "Duchy", "Monarchy",
+               "Motherland", "Fatherland", "Homeland",
+               ((50 > rand 100) ? "Islands" : "Island"), "Archipelago",
+              ) x 3,
+              "Colony", "Crown Colony", "Mandate", "Country", "Nation State", "Dependency",
+              "Territory", "Sultanate", "Dictatorship", "Tyrrany",
+             );
+  # TODO: at VERY low probability, join up multiple types, as in "Republic of the Union of"
+  my $typename = $type[rand @type];
+  if (5 > rand 100) {
+    $typename = makeplural($typename);
+  }
+  my @mod = ();
+  for (0 .. int rand rand 6.5) {
+    push @mod, $modifier[int rand @modifier];
+  }
+  @mod = uniq(@mod);
+  if (12 > int rand 100) {
+    @mod = randomorder(@mod);
+  }
+  # TODO: at low probability, instead of "Modified Foo of Ubbledubgong" do something more like
+  #       "Modified Ubbledubgongese Foo"
+  return join " ", (@mod, $typename, "of", $basename);
+}
+
+sub generate_nation {
+  my ($world) = @_;
+  #warn qq[generate_nation()\n];
+  my ($extant) = grep { not $$_{licensed} } @nation;
+  return $extant if $extant;
+  if (not @world) {
+    generate_world();
+  }
+  $world ||= $world[0];
+  #warn Dumper(+{ world_array => \@world,
+  #               this_world  => $world });
+  #warn qq[generate_nation(): locating nation on $$world{name}\n];
+  # TODO: require that the world have "size" for another nation
+  #       (i.e., don't license the player to operate in more nations
+  #        than exist in the world; require global licenses as needed)
+  my $name = generate_nation_name();
+  my $capital = generate_placename(city_prefix(), city_suffix());
+  #warn qq[generate_nation(): nation will be $name, with the capital at $capital\n];
+  my @provincesuffix = (((" Province") x 30),
+                        (("") x 20),
+                        ((" Prefecture", " State") x 3),
+                        " Area", " Territory", " Sweep", " Fiefdom", " Bailiwick", " Realm",
+                        " Region", " Canton",
+                       );
+  push @extantplace, +{ type   => "municipality",
+                        name   => $capital,
+                        parent => $name,
+                      };
+  push @extantplace, +{ type   => "nation",
+                        name   => $name,
+                        parent => $$world{name},
+                      };
+  # TODO: assign min and max nation sizes inversely to world size
+  my $n = +{ size         => 5 + int rand rand rand 75, # size in provinces
+             provinces    => 0, # number generated so far
+             name         => $name,
+             capital      => $capital,
+             capitalword  => "Capital",
+             provincesuff => $provincesuffix[rand @provincesuffix],
+             parent       => $$world{name},
+           };
+  push @nation, $n;
+  #warn qq[Each province will be called a $$n{provincesuff}.\n  There are now ] . @nation . " nations.\n";
+  return $n;
+}
+
+sub generate_province {
+  my ($nation) = @_;
+  #warn qq[generate_province()\n];
+  my ($extant) = grep { not $$_{licensed} } @province;
+  return $extant if $extant;
+  if (not @nation) {
+    generate_nation();
+  }
+  $nation ||= $nation[0];
+  #warn qq[generate_province(): locating province in $$nation{name}\n];
+  # TODO: require that the nation have "size" for another province
+  #       (i.e., don't license the player to operate in more provinces
+  #        than the nation has; require national licenses as needed)
+  my $name    = generate_placename("", $$nation{provincesuff});
+  my $capital = generate_placename(city_prefix(), city_suffix());
+  my $csuff   = county_suffix();
+  #warn qq[generate_province(): province will be $name, with a capital at $capital\n];
+  push @extantplace, +{ type   => "municipality",
+                        name   => $capital,
+                        parent => $name,
+                      };
+  push @extantplace, +{ type   => "province",
+                        name   => $name,
+                        parent => $$nation{name},
+                      };
+  my $p = +{ size        => 4 + int rand rand 60, # size in counties
+             counties    => 0, # number generated so far
+             # TODO: some nations should have larger min and max province sizes than other nations.
+             name        => $name,
+             capital     => $capital,
+             capitalword => "Capital",
+             countysuff  => $csuff,
+             parent      => $$nation{name},
+           };
+  push @province, $p;
+  #warn qq[generate_province(): Each county will be called a $$p{countysuff}.  There are now ] . @province . qq[ provinces.\n];
+  return $p;
+}
+
 sub generate_county {
-  my $name = generate_placename(county_prefix(), county_suffix());
+  my ($province) = @_;
+  #warn qq[generate_county()\n];
+  my ($extant) = grep { not $$_{licensed} } @county;
+  return $extant if $extant;
+  if (not @province) {
+    generate_province();
+  }
+  $province ||= (grep { $$_{counties} < $$_{size} } @province)[0];
+  # TODO: require that the province have "size" for another county
+  #       (i.e., don't license the player to operate in more counties
+  #        than the province has; require province licenses as needed)
+  my $name = generate_placename(county_prefix(), $$province{countysuff});
   my $seat = generate_placename(city_prefix(), city_suffix());
   my $size = int(15000 + ((1 + rand 15000) * (1 + rand 25) * (1 + rand 100)));
   my $land = int((1 + rand (sqrt($size))) * (1 + rand(sqrt($size))));
   my $mult = ((50 > rand 100)
               ? 1 + (((rand 5) || 1) * ((rand 2) || 0.1) * ((rand 2) || 0.25))
               : ((100 - (((rand 5) || 1) * (rand(5) || 0.1) * (rand(3) || 0.2))) / 100));
-  return +{ name           => $name,
-            capital        => $seat,
-            capitalword    => "County Seat", # TODO: some larger jurisdictions may use a different term.
-            size           => $size, # Total size of the county, in acres.
-            owned_land     => 0,     # Number of acres the player already owns.
-            available_land => $land, # Number of acres the player can potentially purchase.
-            landcost       => int($asset{acre}{value} * $mult),
-          },
+  push @extantplace, +{ type   => "municipality",
+                        name   => $seat,
+                        parent => $name,
+                      };
+  push @extantplace, +{ type   => "county",
+                        name   => $name,
+                        parent => $$province{name},
+                      };
+  my $c = +{ name           => $name,
+             capital        => $seat,
+             capitalword    => "County Seat", # TODO: some larger jurisdictions may use a different term.
+             size           => $size, # Total size of the county, in acres.
+             owned_land     => 0,     # Number of acres the player already owns.
+             available_land => $land, # Number of acres the player can potentially purchase.
+             landcost       => int($asset{acre}{value} * $mult),
+             parent         => $$province{name},
+           };
+  push @county, $c;
+  return $c;
+}
+sub common_surnames {
+  # Note: try to avoid duplicating the ones in generate_placename()
+
+  return ("Alexander", "Allen", "Alvarado", "Alvarez", "Anderson", "Andrews", "Armstrong", "Arnold",
+          "Austin", "Bailey", "Baker", "Barnes", "Bell", "Benedict", "Bennett", "Berry", "Bishop",
+          "Bjarne", "Boyd", "Burns", "Brooks", "Bradley", "Brown", "Bryant", "Burke", "Burton",
+          "Butler", "Campbell", "Carleson", "Carpenter", "Carr", "Carroll", "Carter", "Castellucci",
+          "Castillo", "Chan", "Chapman", "Chavez", "Chen", "Clark", "Cohen", "Cole", "Coleman",
+          "Collins", "Cook", "Cooke", "Cooper", "Costello", "Cox", "Crawford", "Cruz", "Cunningham",
+          "Daniels", "Davis", "Dean", "Delgado", "Diaz", "Dixon", "Duncan", "Dunn", "Dyson", "Eady",
+          "Eddy", "Edwards", "Elder", "Elkins", "Elliott", "Ellis", "Estrada", "Evans", "Farner",
+          "Farnsworth", "Faust", "Ferguson", "Fernandez", "Fischer", "Flores", "Foster", "Foust",
+          "Fox", "Freeman", "Fuchs", "Fuller", "Garcia", "Gardner", "Gibbs", "Gibson", "Gilbert",
+          "Gomez", "Gonzales", "Gordon", "Graham", "Grassi", "Gray", "Griffin", "Guzman", "Hall",
+          "Hamilton", "Hansen", "Harper", "Harris", "Hardt", "Harvey", "Hawkins", "Henderson",
+          "Hernandez", "Herrera", "Hill", "Hoffman", "Holmes", "Howard", "Howell", "Hoying",
+          "Hudson", "Hughes", "Humrichouser", "Hunt", "Jacobs", "Jacobson", "James", "Jenkins",
+          "Jensen", "Jimenez", "Johns", "Johnson", "Jones", "Jordan", "Kaplan", "Kelly", "Kim",
+          "Kirk", "Knight", "Larson", "Lawrence", "Lawson", "Layne", "Lewis", "Long", "Lopez",
+          "Louis", "Lucas", "Lynch", "Maldonaldo", "Martin", "Martinez", "Mason", "Matthews",
+          "McCoy", "McCready", "McDonald", "MacElligott", "MacIntyre", "Medina", "Meijer",
+          "Menendez", "Mendoza", "Meyer", "Miller", "Mills", "Mitchell", "Montgomery", "Moore",
+          "Morales", "Moreno", "Morgan", "Morris", "Morrison", "Murphy", "Murray", "Myers",
+          "Nichols", "Nguyen", "O'Brien", "Okoje", "Olson", "Olusola", "Ortega", "Ortiz",
+          "O'Reilly", "Owens", "Palmer", "Park", "Parker", "Patel", "Patterson", "Payne",
+          "Pennington", "Perez", "Perkins", "Perry", "Peters", "Peterson", "Phillips", "Porter",
+          "Powell", "Price", "Ramirez", "Ramos", "Ramsay", "Rawlins", "Ray", "Reed", "Reyes",
+          "Reynolds", "Richards", "Richardson", "Riley", "Rivera", "Roberts", "Robertson",
+          "Robinson", "Rodriguez", "Rogers", "Romero", "Rose", "Ross", "Ruiz", "Rupp", "Russell",
+          "Ryan", "Salazar", "Sallee", "Sanchez", "Sanders", "Sandoval", "Santiago", "Santos",
+          "Schiller", "Schmidt", "Schultz", "Schuman", "Scott", "Shaw", "Short", "Shuck", "Silver",
+          "Simmons", "Simpson", "Singh", "Smith", "Snyder", "Soto", "Spayde", "Spencer", "Stein",
+          "Stephens", "Stevens", "Stewart", "Stone", "Sullivan", "Thomas", "Thompson", "Tucker",
+          "Torres", "Turner", "Vargas", "Vasquez", "Vega", "Wagner", "Wakim", "Walker", "Wallace",
+          "Ward", "Warren", "Waterson", "Watkins", "Watson", "Weaver", "Webb", "Weber", "Welch",
+          "Wells", "Wheeler", "White", "Williams", "Willis", "Wright", "Young", "Zed");
 }
 
 sub generate_placename {
   my ($prefix, $suffix) = @_;
   my ($basename, @option);
+  #warn qq[generate_placename()\n];
   if (70 > rand 100) {
     # Try to pick a common placename:
-    @option = ("Smith", "Lincoln", "Franklin", "Clinton", "Johnson",
+    @option = ("Lincoln", "Franklin", "Clinton",
                "George", "Elizabeth", "Virginia", "Victoria", "Henry",
                "Chester", "Marion", "Bristol", "Dover", "Salem", "Win", "Mil", "Milton",
                "Lebanon", "Alexandria", "Antioch", "Berlin", "Birmingham", "Athen", "Blooming",
@@ -1621,12 +2228,12 @@ sub generate_placename {
                "Spring", "Summer", "Winter", "Love", "Day", "Man", "Ox", "New",
                "Clay", "Sand",  "Ash", "Burn",
                "Farm", "Farmer", "River", "Rivers", "King", "Kings", "Castle",
-               "Green", "Black", "White", "Red", "Blue", "Dark", "Light", "Hard", "Soft",
+               "Green", "Black", "White", "Red", "Blue", "Grey", "Dark", "Light", "Hard", "Soft",
                "Washington", "Adams", "Jefferson", "Madison", "Monroe", "Harrison",
-               "Payne", "Taylor", "Tyler", "Pierce", "Hayes", "Garfield", "Arthur",
+               "Taylor", "Tyler", "Pierce", "Hayes", "Garfield", "Arthur",
                "Roosevelt", "Wilson", "Harding", "Hoover", "Kennedy", "Ford", "Reagan",
                "Vanderbilt", "Carnegie", "Rockefeller", "Buffett", "Jacobs",
-               "Nelson", "Davis", "Lee", "Grant", "Jackson", "Sherman",
+               "Nelson", "Lee", "Grant", "Jackson", "Sherman",
                "Patton", "MacArthur", "Marshall", "Pershing",
                "Euler", "Kline", "Gauss", "Euclid", "Bernoulli", "Newton", "Lowe",
                "Torvalds", "Wall", "Knuth", "Raymond", "Ritchie", "Kernighan",
@@ -1634,14 +2241,17 @@ sub generate_placename {
                "Pleasant", "Good", "Right", "Center", "Fair", "Wood",
               );
     if ($suffix eq "ton") {
-      push @option, $_ for (qw(Arling Lexing Ea));
+      push @option, $_ for (qw(Arling Lexing Ea Middle Nor));
       @option = map { s/t$//; $_ } @option;
     }
+  } elsif (30 > rand 100) {
+    @option = common_surnames();
   } else {
     @option = map { randomplaceword() } 1 .. 30;
   }
+  #warn qq[generate_placename(): ] . @option . qq[ options to pick from.\n];
   my $tries = 0;
-  while (((not $basename) or (grep { $_ eq $basename } @extantplace) or
+  while (((not $basename) or (grep { lc($$_{name}) eq lc($basename) } @extantplace) or
           (index(lc($basename), lc($suffix)) > 0) or
           (index(lc($basename), lc($prefix)) > 0))
          and ($tries < 50)) {
@@ -1650,6 +2260,7 @@ sub generate_placename {
       my @joiner = ("", " ", "-");
     }
   }
+  #warn qq[generate_placename(): returning\n];
   return $prefix . $basename . $suffix;
 }
 sub city_prefix {
@@ -1666,30 +2277,33 @@ sub commonplacewordsuffixes {
 }
 sub city_suffix {
   return "" if 50 > rand 100;
-  my (@option) = map { $_, $_, $_, $_, $_ } (qw(ton berg sberg burg ville town ia s side ford));
+  my (@option) = map { (($_) x 10) } (qw(ton ton berg sberg burg ville town ia s side ford));
   push @option, $_ for (commonplacewordsuffixes(),
                         " Valley", " Lake", " Beach", " Falls", " Wood", " City", " Junction",
                         " Harbor", " Point", " Heights", " Hills", " Landing", " Center", " Grove");
-  for my $maybe ("view", " Park", " Pier", " Road", " Ford", " Township", " Village",
+  for my $maybe ("view", " Park", " Pier", " Road", " Ford", " Township", " Village", " Mesa",
+                 " Flats", " Gorge", " Canyon", " Cliffs",
                  "home", "house") {
     push @option, $maybe if 30 > rand 100;
   }
   return $option[int rand @option];
 }
 sub county_prefix {
-  return "";
+  return ""; # TODO
 }
 sub county_suffix {
-  # TODO: Make this deterministic, depending on which larger jurisdiction you're in.
-  my (@option) = (" County", " County", " County", " County", " County", " County", " County", " County",
-                  "shire", " Shire", "shire County", " MSA",
-                  " Parish", " Borough", " Section", " District", " Division",
+  my (@option) = (((" County") x 80),
+                  ((" Parish", " Borough", "shire", " Shire", "") x 10),
+                  ((" Section", " District", " Division", " MSA", " Precinct",
+                    " Confine", " Jurisdiction") x 3),
+                  " Purview", " Barony", " Zone", " Demesne",
+                  " Duty", " Holding", " Tract", "shire County",
                  );
   return $option[int rand @option];
 }
 
 sub randomplaceword {
-  my @syllable = map { randomplacesyllable() } 1 .. 2 + (int(rand 2) * (rand 2) * (rand 2));
+  my @syllable = map { randomsyllable() } 1 .. 2 + (int(rand 2) * (rand 2) * (rand 2));
   if ((4 > scalar @syllable) and (40 > rand 100)) {
     my @suffix = ("er", "er", "er", "er", "ing", "ing", "ing",
                   "a", "ia", "ac", "in", "en", "on", "ie", "ish",
@@ -1704,7 +2318,7 @@ sub randomplaceword {
   $word =~ s/(.)\1\1/$1$1/g;
   return ucfirst $word;
 }
-sub randomplacesyllable {
+sub randomsyllable {
   my @initial = (qw(b b b b b b br bl c c c ch cl cr chr d d d d d dr dl f f f
                     fr fl g g gh gr gl h j k k k l l l m m m m n n n n
                     p p p pr pl ph pf qu r r r r r r r
@@ -1735,7 +2349,8 @@ sub expendcash {
 
 sub gaincash {
   my ($amount, $type, $subcat) = @_;
-  # type will generally be sales for now
+  # The type will  generally be sales in  the early game, but  in later phases there  can be capital
+  # gains from other sources.
   trackcashflow($amount, $type, $subcat);
   $cash += $amount;
   # Percentage-based budget categories, go:
@@ -1744,6 +2359,44 @@ sub gaincash {
     my $budgetamt = int($amount * $pct / 100);
     expendcash($budgetamt, "budget", $budget{$bk}{name}) if $budgetamt;
   }
+  while ($cash > $investcashover) {
+    buybond();
+  }
+}
+
+sub sellbond {
+  my ($b) = @_;
+  croak "sellbond(): what bond?  " . Dumper($b) if not ref $b;
+  my $amt = $$b{amount};
+  if ($$b{mature}->ymd() le $date->ymd()) {
+    my $term = $$b{mature}->year() - $$b{issued}->year();
+    $amt = int interest($amt, $$b{rate}, $term);
+  }
+  $$b{id} = "__SOLD__";
+  gaincash($amt, "investment", "bonds");
+  @bond = grep { $$_{id} ne "__SOLD__" } @bond;
+}
+
+sub buybond {
+  my ($amt, $issuer, $rate, $term) = @_;
+  $amt ||= $defaultbondamt;
+  return if $amt >= ($cash * 1.1);
+  $issuer ||= "Federal Government";
+  # TODO: model a changing prime rate based on simple macroeconomic modeling.
+  $rate ||= 1.5; # This is the Annual Percentage Rate (i.e., it gets divided by 100 when doing calculations).
+  $term ||= 30 * 12;
+  my $issued = $date->clone();
+  my $mature = $issued->clone()->add( months => $term );
+  expendcash($amt, "investment", "bonds");
+  my $b = +{ issuer => $issuer,
+             amount => $amt,
+             issued => $issued,
+             mature => $mature,
+             rate   => $rate,
+             id     => ($date->year() . (sprintf "%02d%02d", $date->month(), $date->mday()) . int rand (32767 * 32767)),
+           };
+  push @bond, $b;
+  return $b;
 }
 
 sub trackcashflow {
@@ -1758,9 +2411,35 @@ sub trackcashflow {
   }
 }
 
+sub interest {
+  my ($principal, $rate, $term) = @_;
+  # The rate should be the _percentage_ rate, so e.g. 2.5 for 2.5% interest.
+  # The rate and term must use the same time unit, e.g., they can both be per annum.
+  # The result will NOT be rounded or truncated; the caller must do that if desired.
+  return 0 if not $principal;
+  return $principal if not $rate;
+  return $principal if not $term;
+  my $e = 2.718281828459; # "My hamster I exploded by grenades.  I exploded it brutally, with anger, willfully."
+  my $rt = $term * $rate / 100;
+  return $principal * ($e ** $rt);
+}
+
+sub adjust_primerate {
+  # TODO: do simple economic modeling so that prime rate changes follow reasonable patterns.
+  # For now, just do random adjustments:
+  my $numerator   = 100 + rand 5;
+  my $denominator = 100 + rand 5;
+  my $p = $primerate * $numerator / $denominator;
+  return 1 if $p < 1;
+  return 5 if $p > 5;
+  $primerate = $p;
+}
+
 sub updatetopbar {
   my ($w) = @_;
-  my $now = DateTime->now( time_zone => $option{localtimezone} );
+  my ($now); eval {
+    $now = DateTime->now( time_zone => ($option{localtimezone} || "UTC") );
+  }; croak "DateTime problem in updatetopbar()" if not ref $now;
   my $dtext = $date->year() . " " . $date->month_abbr() . " " . $date->mday()
     . " " . $date->day_abbr()
     . ($paused ? " PAUSED" : "");
@@ -1776,10 +2455,10 @@ sub toggle_pause {
   my ($force) = @_;
   if ($paused and not $force) {
     $paused = undef;
-    push @message, ["Resumed. ", "meta"];
+    push @message, ["Resumed.", "meta"];
   } else {
     $paused = 1;
-    push @message, ["Paused. ", "meta"];
+    push @message, ["Paused.", "meta"];
   }
 }
 
@@ -1864,6 +2543,235 @@ sub writepricelist {
     print LST "\n";
   }
   close LST;
+}
+
+sub abbreviate_stockname {
+  my ($name) = @_;
+  my @letter = grep { /([A-Z])/i } split //, $name;
+  my @uclett = grep { $_ eq uc $_ } @letter;
+  my @lclett = grep { $_ eq lc $_ } @letter;
+  if (4 == scalar @uclett) {
+    return join "", @uclett;
+  }
+  while (3 < scalar @uclett) {
+    my @l = map { [$_ => rand 100] } @uclett;
+    my $max = 0;
+    for my $char (@l) {
+      $max = $$char[1] if $max < $$char[1];
+    }
+    @uclett = map { $$_[0] } grep { $$_[1] ne $max } @l;
+  }
+  while (3 > scalar @uclett) {
+    my $char = uc $lclett[rand @lclett];
+    push @uclett, $char;
+  }
+  return join "", @uclett;
+}
+
+sub stockquality {
+  my ($symbol) = @_;
+  my $sq = log($stock{$symbol}{sales} || 1);
+  my $aq = log($stock{$symbol}{assets} || 1);
+  my $cq = log($stock{$symbol}{cash} || 1);
+  my $dq = log($stock{$symbol}{debt} || 1);
+  return int((2 * $sq) + $aq + $cq - $dq);
+}
+
+sub describestock {
+  my ($symbol) = @_;
+  my $quality = stockquality($symbol);
+  my $qualdesc =
+    ($quality > 80) ? "an amazing" :
+    ($quality > 70) ? "a leading" :
+    ($quality > 60) ? "an innovative" :
+    ($quality > 50) ? "a sturdy" :
+    ($quality > 40) ? "a" :
+    ($quality > 30) ? "an underdog" :
+    "a slightly dodgy";
+  my $oshares = int($stock{$symbol}{shares} - $stock{$symbol}{owned});
+  #my ($i) = grep { $$_{industry} eq $stock{$symbol}{industry} } @industry;
+  return $stock{$symbol}{name} . qq[ ($symbol) is ] . $qualdesc . " company in the "
+    . $stock{symbol}{industry} . " sector, with $oshares outstanding shares of class-A stock.";
+}
+
+sub newstock {
+  my @letter  = qw(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z);
+  my $ind       = $industry[rand @industry];
+  my $stockname = newcompanyname($ind);
+  my $symbol    = abbreviate_stockname($stockname);
+  my $slength   = (30 > rand 100) ? 4 : 3;
+  my $tries     = 0;
+  while (((not $symbol) or (ref $stock{$symbol})) and ($tries++ < 5)) {
+    # If the symbol doesn't match the company name, it's not a big deal.  Real-world stock ticker
+    # symbols are frequently based on an old name that is no longer used, or are chosen arbitrarily
+    # when the symbol that was wanted was already taken.  The important thing is that it's unique.
+    $symbol = join "", map { $letter[rand @letter] } 1 .. $slength;
+  }
+  return if not $symbol;
+  return if ref $stock{$symbol};
+  my $price = sprintf("%0.2f", rand 100);
+  for (1 .. 4) {
+    if (30 > rand 100) {
+      $price = $price * ((50 > rand 100) ? 5 : 2);
+    }
+    if (30 > rand 100) {
+      $price = $price / ((50 > rand 100) ? 5 : 2);
+    }}
+  $price = (int($price * 1000) || 1) / 10;
+  while ($price < 100) {
+    $price = 2 * $price;
+  }
+  my $sales = int rand 50000;
+  for (1 .. 10) {
+    if (50 > rand 100) {
+      $sales = $sales * 10;
+    }}
+  my $assets = $sales;
+  for (1 .. 4) {
+    if (50 > rand 100) {
+      $assets = $assets * 10;
+    } else {
+      $assets = $assets / 10;
+    }}
+  my $ccash = $sales;
+  for (1 .. 6) {
+    if (30 > rand 100) {
+      $ccash = $ccash * ((70 > rand 100) ? 2 : 5);
+    } else {
+      $ccash = $ccash / 10;
+    }}
+  $ccash = 1000 + int $ccash;
+  my $debt = $assets;
+  for (1 .. 5) {
+    if (50 > rand 100) {
+      $debt = $debt * 2;
+    } else {
+      $debt = $debt / 2;
+    }}
+  $debt = int $debt; $debt = 0 if $debt < 1000;
+  return +{ symbol   => $symbol,
+            name     => $stockname,
+            industry => $$ind{industry},
+            owned    => 0,
+            shares   => 1000000 * int(5 + ((1 + rand 2) * (1 + rand 2) * (1 + rand 5) * (1 + rand 5))),
+            price    => $price,
+            sales    => $sales,
+            assets   => $assets,
+            cash     => $ccash,
+            debt     => $debt,
+            idx      => int rand 65535, # for ticker-order continuity across save/restore.
+            movement => 0,
+          };
+}
+
+sub newcompanyname {
+  my ($i) = @_;
+  # TODO: sometimes use standard corporate affixes like "Global", ", Inc.", "LLC", etc.
+  my $suffix = ((ref $$i{suffix})
+                ? $$i{suffix}->()
+                : ((95 > rand 100)
+                   ? (" " . ucfirst randomsyllable())
+                   : ucfirst randomsyllable()));
+  my $prefix = ((ref $$i{prefix})
+                ? $$i{prefix}->()
+                : (ucfirst(randomsyllable()) . ((85 > rand 100) ? " " : "")));
+  my @nameword = (common_surnames(),
+                  map { join "", map { randomsyllable() } 1 .. 2 + int rand 2 } 1 .. 25,
+                 );
+  my $basename;
+  if (50 > rand 100) {
+    my $word = $nameword[int rand @nameword];
+    if (not $word =~ /[szcx][hz]?$/) {
+      my @suff = ((("s") x 10),
+                  (("'s") x 5),
+                  "s'", "z", "Z");
+      $word .= $suff[rand @suff];
+    } elsif (($word =~ /s$/) and (25 > rand 100)) {
+      $word .= "on";
+    }
+    $basename = ucfirst $word;
+  } elsif (10 > rand 100) {
+    # Note: this ignores the prefix and suffix, because stringing three together is already long.
+    # Thus it should not be very common, hence the low probability.
+    return ucfirst($nameword[int rand @nameword]) . ", "
+      . ucfirst($nameword[int rand @nameword]) . ", "
+      . ((80 > rand 100) ? "and" : "&") . " "
+      . ucfirst($nameword[int rand @nameword]);
+  } else {
+    my $one = $nameword[int rand @nameword];
+    my $two = $nameword[int rand @nameword];
+    my @joiner = (((" & ", " and ", "-") x 5),
+                  ((" ") x 12),
+                  "/", "");
+    $basename = ucfirst($one) . $joiner[int rand @joiner] . ucfirst($two);
+  }
+  return $prefix . $basename . $suffix;
+}
+
+sub stock_market_industries {
+  return (+{ industry   => "Agribusiness",
+             volatility => 50,
+             growth     => 5,
+             
+           },
+          +{ industry   => "Financial",
+             volatility => 70,
+             growth     => 60,
+           },
+          +{ industry   => "Transportation",
+             volatility => 20,
+             growth     => 20,
+           },
+          +{ industry   => "Retail",
+             volatility => 45,
+             growth     => 35,
+           },
+          +{ industry   => "Medical",
+             volatility => 50,
+             growth     => 60,
+           },
+          +{ industry   => "Tourism",
+             volatility => 60,
+             growth     => 50,
+           },
+          +{ industry   => "Entertainment",
+             volatility => 90,
+             growth     => 35,
+           },
+          +{ industry   => "Hamartics",
+             volatility => 30,
+             growth     => 30,
+           }
+          +{ industry   => "Technology",
+             volatility => 30,
+             growth     => 80,
+             suffix     => sub { my @letter  = qw(A B C D E F G H I J K L M N O P Q R S T U V W X Y Z);
+                                 if (20 > rand 100) {
+                                   my @s = (" Tech", "tech", " Technology");
+                                   return $s[rand @s];
+                                 } elsif (30 > rand 100) {
+                                   return "";
+                                 } elsif (40 > rand 100) {
+                                   return " " . uc join "", map { $letter [@letter] } 1 .. ((80 > rand 100) ? 2 : 3);
+                                 }
+                                 my @s = (" Systems", " Technology", " Software", " Microsystems", " Data",
+                                          " Computing", " Computer",  " Infosystems", " Infotech", " Automation",
+                                          " Robotics", " Digital", " Digitech", " Solutions",
+                                          "sys", "ware", "icity", "ity", "comp", "mation", "etics", "ata");
+                                 if (40 > rand 100) {
+                                   push @s, $_ for (" Chips", " Circuits", " Social", " Media", " IT",
+                                                    " Machines", " Boards", " Power", " Cloud", " Energy",
+                                                    " Mobile", " Communications",
+                                                   );
+                                 }
+                                 if (20 > rand 100) {
+                                   push @s, $_ for (" Integrated", " Cryptography", " Analysis", " Cybernetics",
+                                                    " Fabrication", " Meta", " Mega", " Alpha", " Beta");
+                                 }
+                                 return $s[rand @s];
+                               },
+           },
+          );
 }
 
 #################################################################################################
@@ -1983,7 +2891,81 @@ sub init_windowitems {
    },
    buy => sub {
      my $k = "a";
-     if ($buyitem) {
+     if ($buystock) {
+       my ($industry) = grep { $$_{industry} eq $buystock } @industry;
+       if ($industry) {
+         my @sym = grep { $stock{$_}{industry} eq $industry } keys %stock;
+         return (
+                 (map {
+                   my $s = $_;
+                   my $key = $k++;
+                   if ($key eq "c") {
+                     $key = $k++;
+                   }
+                   +{ name    => $s . "=" . $stock{$s}{name},
+                      key     => $key,
+                      cost    => shownum($stock{$s}{price}),
+                      fg      => $$industry{fg} || "blue",
+                      hilight => $$industry{hilightfg} || "cyan",
+                    },
+                  } @sym),
+                 +{ name    => "cancel",
+                    key     => "c",
+                    cost    => "0",
+                    fg      => $$industry{fg} || "blue",
+                    hilight => $$industry{hilightfg} || "cyan",
+                  },
+                );
+       } elsif ($stock{$buystock}) {
+         my $avail = $stock{$buystock}{shares} - $stock{$buystock}{owned};
+         my @qtty  = grep { $buyqtty{$_}{number} le $avail } @bytens;
+         return ((map { my $q = $buyqtty{$_};
+                        my $price = $stock{$buystock}{price} * $$q{number};
+                        +{ key     => $$q{key},
+                           name    => $$q{name},
+                           number  => $$q{number},
+                           value   => shownum($price),
+                           cost    => $price,
+                           fg      => $$q{fg} || (($price <= $cash) ? "blue" : "grey"),
+                           hilight => $$q{hilight} || (($price <= $cash) ? "cyan" : "black"),
+                         },
+                      } @qtty),
+                 +{ name    => "cancel",
+                    key     => "c",
+                    cost    => "0",
+                    fg      => $$industry{fg} || "blue",
+                    hilight => $$industry{hilightfg} || "cyan",
+                  },
+                 (map {
+                   +{ name => $_,
+                      fg   => $$wbuy{helpcolor} || $$wbuy{fg} || "grey",
+                    },
+                  } format_help_info($wbuy, describestock($buystock))));
+       } elsif ($buystock eq "category") {
+         return (
+                 (map {
+                   my $i = $_;
+                   my $key = $k++;
+                   if ($key eq "c") {
+                     $key = $k++;
+                   }
+                   +{ name    => ucfirst $$i{industry},
+                      key     => $key,
+                      cost    => "?",
+                      fg      => $$i{fg} || "blue",
+                      hilight => $$i{hilightfg} || "cyan",
+                    },
+                  } @industry),
+                 +{ name    => "cancel",
+                    key     => "c",
+                    cost    => "0",
+                    fg      => $$wbuy{fg} || "blue",
+                    hilight => $$wbuy{hilightfg} || "cyan",
+                  },
+                );
+       #} elsif () {
+       }
+     } elsif ($buyitem) {
        return (+{ name => ucfirst $asset{$buyitem}{name},# . " <" . $asset{$buyitem}{id} . ">",
                   fg   => "teal",
                 },
@@ -2032,12 +3014,19 @@ sub init_windowitems {
      } keys %asset;
    },
    assets   => sub {
-     # TODO: specify colors
+     # TODO: allow colors to be customized
+     my @investmentitem;
+     push @investmentitem, +{ name  => "Bonds",
+                              value => (scalar @bond),
+                              fg    => "gold" }
+       if scalar @bond;
+     # TODO: stonks.
      return (
              +{ name  => "Cash",
                 value => shownum($cash),
                 fg    => "gold" },
-              (map {
+             @investmentitem,
+             (map {
                 +{ name  => ucfirst($asset{$_}{plural} || makeplural($asset{$_}{name})),
                    value => shownum($asset{$_}{qtty}),
                    fg    => $asset{$_}{assetfg},
@@ -2074,8 +3063,10 @@ sub process_key {
            ("prefix" eq $globalkeybinding{$inputprefix . $k})) {
     $inputprefix .= $k;
   } elsif ($wfocus and ref $$wfocus{input}) {
-    return $$wfocus{input}->($wfocus, $inputprefix . $k);
+    my $result = $$wfocus{input}->($wfocus, $inputprefix . $k);
     $inputprefix = "";
+    eggwidget_onscroll($wfocus);
+    return $result;
   } else {
     debuglog("Nothing to do with keystroke '$k'.");
   }
@@ -2083,6 +3074,37 @@ sub process_key {
 
 sub global_key_bindings {
   return (
+          chr(27) . chr(91) => "prefix",
+          chr(27) . chr(91) . chr(65) => sub { # up arrow
+            scroll_widget_to($wfocus, ($$wfocus{vscrollpos} || 0) - 1);
+          },
+          chr(27) . chr(91) . chr(66) => sub { # down arrow
+            scroll_widget_to($wfocus, ($$wfocus{vscrollpos} || 0) + 1);
+          },
+          chr(27) . chr(91) . chr(53) => "prefix",
+          chr(27) . chr(91) . chr(53) . chr(27) => "prefix",
+          chr(27) . chr(91) . chr(53) . chr(27) . chr(91) => "prefix",
+          chr(27) . chr(91) . chr(53) . chr(126) => sub { # PgUp
+            scroll_widget_to($wfocus, ($$wfocus{vscrollpos} || 0) - ($$wfocus{contentsizey} || 1));
+          },
+          chr(27) . chr(91) . chr(53) . chr(27) . chr(91) . chr(126) => sub { # PgUp
+            scroll_widget_to($wfocus, ($$wfocus{vscrollpos} || 0) - ($$wfocus{contentsizey} || 1));
+          },
+          chr(27) . chr(91) . chr(54) => "prefix",
+          chr(27) . chr(91) . chr(54) . chr(126) => sub { # PgDn
+            scroll_widget_to($wfocus, ($$wfocus{vscrollpos} || 0) + ($$wfocus{contentsizey} || 1));
+          },
+          chr(27) . chr(91) . chr(54) . chr(27) => "prefix",
+          chr(27) . chr(91) . chr(54) . chr(27) . chr(91) => "prefix",
+          chr(27) . chr(91) . chr(54) . chr(27) . chr(91) . chr(126) => sub { # PgDn
+            scroll_widget_to($wfocus, ($$wfocus{vscrollpos} || 0) + ($$wfocus{contentsizey} || 1));
+          },
+          chr(27) . chr(91) . chr(70) => sub { # End
+            scroll_widget_to($wfocus, ($$wfocus{vscrollend} || 0));
+          },
+          chr(27) . chr(91) . chr(72) => sub { # Home
+            scroll_widget_to($wfocus, ($$wfocus{vscrollhome} || 0));
+          },
           chr(9) => sub { # Tab:
             rotate_focus(1); # TODO: test this; I'm not sure it's working.
           },
@@ -2094,6 +3116,7 @@ sub global_key_bindings {
             redraw(@_);
           },
           chr(24) => sub { # Ctrl-X
+            # TODO: automatically save unless the user has set an option to NOT do that.
             print "\nExiting game at user request.\n"; exit 0;
           },
           "?" => sub {
@@ -2174,6 +3197,12 @@ sub globalhelp {
   return (qq[Press F1 for help, F4 to save, F5 to redraw the screen.  Other function keys select the various widgets, as labeled.]);
 }
 
+sub input_messagelog {
+  my ($w, $k) = @_;
+  #if ($k eq ) {
+  #}
+}
+
 sub input_cashflow {
   my ($w, $k) = @_;
   $$w{helpmode} = undef;
@@ -2206,13 +3235,20 @@ sub input_budget {
   $windowitem{budget} = [budget_items()];
 }
 
+sub input_stockmarket {
+  croak "TODO";
+}
 
 sub input_buy {
   my ($w, $k) = @_;
   my @item = windowitems($w);
-  if ($buyitem) {
+  if ($buystock) {
+    return input_stockmarket($w, $k);
+  } elsif ($buyitem) {
     my ($i) = grep { $k eq $$_{key} } @item;
-    if (($$i{number} > 0) and ($$i{value} <= $cash)) {
+    if ($$i{placetype}) {
+      croak "TODO";
+    } elsif (($$i{number} > 0) and ($$i{value} <= $cash)) {
       if (safetobuy($buyitem, $$i{number})) {
         buyasset($buyitem, $$i{number}, $$i{cost}, "player");
       } else {
@@ -2221,7 +3257,7 @@ sub input_buy {
         } elsif ($asset{$buyitem}{landsize}) {
           $asset{acre}{unlocked}{1} ||= 1;
         }
-        push @message, ["You don't have room for $$i{number} more " .
+        push @message, ["You don't have room for " . shownum($$i{number}) . " more " .
                         sgorpl($$i{number}, $asset{$buyitem}{name},
                                $asset{$buyitem}{plural}) . ".", "actioncancel"];
       }
@@ -2238,7 +3274,6 @@ sub input_buy {
     $buyitem = undef;
   } else {
     my ($i) = grep { $k eq $$_{key} } @item;
-    # TODO: if the only unlocked buy quantity is 1, go ahead and buy 1 if we can afford it.
     $buyitem = $i ? $$i{id} : undef;
     $debughint = $buyitem;
   }
@@ -2282,6 +3317,22 @@ sub drawwidgets {
   }
 }
 
+sub scroll_eggwidget_to_end {
+  my ($w) = @_;
+  my (@wi) = windowitems($w);
+  return ((scalar @wi) + 1 - $$w{contentsizey});
+}
+
+sub eggwidget_onscroll {
+  my ($w) = @_;
+  my (@wi) = windowitems($w);
+  if ($$w{vscrollpos} > ((1 + scalar @wi) - $$w{contentsizey})) {
+    $$w{vscrollpos} = (1 + scalar @wi) - $$w{contentsizey};
+  } elsif ($$w{vscrollpos} < 0) {
+    $$w{vscrollpos} = 0;
+  }
+}
+
 sub doeggwidget {
   my ($w, $s, @more) = @_;
   $$w{bg} ||= "black";
@@ -2302,7 +3353,15 @@ sub doeggwidget {
     doborder($w, $s, @more);
   }
   my $n = 0;
-  for my $i (windowitems($w)) {
+  my @wi = windowitems($w);
+  $$w{vscrollend} = sub { scroll_eggwidget_to_end($w) };
+  if ($$w{vscrollpos} > 1) {
+    # TODO: handle re-using keys when scrolling through so many items that there aren't enough keys.
+    #       I want this capability for the stock market.
+    for (1 .. ($$w{vscrollpos} - 1)) {
+      shift @wi;
+    }}
+  for my $i (@wi) {
     $n++;
     if ($$w{y} + $n + 1 < $$w{ymax}) { # TODO: allow scrolling if needed.
       if ($$i{key}) {
@@ -2343,12 +3402,88 @@ sub doeggwidget {
     }}
 }
 
+sub doticker {
+  my ($w, $s, @more) = @_;
+  return if $$w{disabled};
+  # For now, for debugging, I want it to show all the time.
+  #return if $gamephase < 3;
+  my @sym = @{$$w{list} || +[]};
+  if ((not scalar @sym) or not ($$w{rotate_counter} % 3)) {
+    my %onlist = map { $_ => 1 } @sym;
+    my @add = sort {
+      $stock{$b}{idx} <=> $stock{$a}{idx}
+    } grep {
+      not $onlist{$_}
+    } keys %stock;
+    push @add, shift @sym;
+    @sym = (@sym, @add);
+    $$w{list} = [@sym];
+  }
+  $$w{rotate_counter}++;
+  my $length = 1;
+  my $hbg = $option{focusbgcolor} || $$w{focusbg} || $$w{bg} || "black";
+  my $bg  = (($$w{id} eq $$wfocus{id}) ? $hbg : undef) ||
+    ($$w{transparent} ? '__TRANSPARENT__' : $$w{bg}) ||
+    '__TRANSPARENT__';
+  if ($$w{redraw} or ($bg and ($bg ne "__TRANSPARENT__")) or (not ($$w{rotate_counter} % 5))) {
+    blankrect($s, $$w{x}, $$w{y}, $$w{xmax}, $$w{ymax},
+              sub { my ($x,$y) = @_;
+                    colorlog("sub [that doeggwidget passed to blankrect]: asking widgetbg for 'tickerbg', passing old=" . Dumper($$s[$x][$y]));
+                    return widgetbg($w, "tickerbg", $$s[$x][$y]);
+                  }, " ", widgetfg($w));
+    my $posn = 1;
+    while ((($posn + 9) < $xmax) and (scalar @sym)) {
+      my $symbol = shift @sym;
+      if ($symbol) {
+        my $length = length($symbol) + 1;
+        my $price  = shownum($stock{$symbol}{price}) || "?";
+        $length += length($price);
+        my $movement = "";
+        if ($stock{$symbol}{movement}) {
+          $movement = ($stock{$symbol}{movement} > 0) ? "↑" : "↓";
+          $length++;
+        }
+        if ($posn + $length + 1 < $xmax) {
+          dotext(+{ id          => $$w{id} . "__stock__" . $symbol . "__symbol",
+                    text        => $symbol,
+                    x           => $posn,
+                    y           => $$w{y},
+                    bg          => $$w{bg},
+                    fg          => $$w{fg} || "white",
+                    transparent => $$w{transparent},
+                  }, $s);
+          dotext(+{ id          => $$w{id} . "__stock__" . $symbol . "__price",
+                    text        => $price,
+                    x           => $posn + length($symbol) + 1,
+                    y           => $$w{y},
+                    bg          => $$w{bg},
+                    fg          => $$w{pricefg} || $$w{fg} || "yellow",
+                    transparent => $$w{transparent},
+                  }, $s);
+          my $mvtcolor = ($stock{$symbol}{movement} > 0) ? ($$w{posmovementfg} || "green") : ($$w{negmovementfg} || "red");
+          dotext(+{ id          => $$w{id} . "__stock__" . $symbol . "__movement",
+                    text        => $movement,
+                    x           => $posn + length($symbol) + 1 + length($price),
+                    y           => $$w{y},
+                    bg          => $$w{bg},
+                    fg          => $mvtcolor,
+                    transparent => $$w{transparent},
+                  }, $s);
+          $posn += $length + 1;
+        }
+      }
+    }
+  }
+}
+
 sub dowidget {
   my ($w, $s, @more) = @_;
   if (is_standard_widget($w)) {
     dostandardwidget($w, $s, @more);
   } elsif ($$w{type} eq "egggame") {
     doeggwidget($w, $s, @more);
+  } elsif ($$w{type} eq "ticker") {
+    doticker($w, $s, @more);
   } else {
     widgetlog("unhandled widget type, '$$w{type}'");
     dotext($w, $s, @more);
@@ -2437,7 +3572,7 @@ sub saveoptions {
     print OPT "\n";
     print OPT qq[# $$o{desc}\n];
     print OPT qq[# default: $$o{default}\n];
-    print OPT qq[$$o{name}=$$o{value}\n];
+    print OPT qq[$$o{name}=$option{$$o{name}}\n];
   }
   print OPT qq[\n\n## EOF\n\n];
   close OPT;
@@ -2454,11 +3589,13 @@ sub restoregame {
       my $line = $_;
       if ($line =~ /^\s*Global[:](Date|RunStarted|NGPETA|BirthDate)=(\d+)-(\d+)-(\d+)/) {
         my ($whichdate, $y, $m, $d) = ($1, $2, $3, $4);
-        my $dt = DateTime->new( year  => $y,
-                                month => $m,
-                                day   => $d,
-                                hour  => 6,
-                              );
+        my ($dt); eval {
+          $dt = DateTime->new( year  => $y,
+                               month => $m,
+                               day   => $d,
+                               hour  => 6,
+                               time_zone => ($option{localtimezone} || "UTC"),
+                             ); }; croak "DateTime error in restoregame()" if not ref $dt;
         if ($whichdate eq "Date") {
           $date = $dt;
         } elsif ($whichdate eq "RunStarted") {
@@ -2473,6 +3610,9 @@ sub restoregame {
         $restored{global}++;
       } elsif ($line =~ /^\s*Global[:]Cash=(\d+) zorkmid/) {
         $cash = $1;
+        $restored{global}++;
+      } elsif ($line =~ /^\s*Global[:]Primerate=([0-9.]+)%\s*$/) {
+        $primerate = $1;
         $restored{global}++;
       } elsif ($line =~ /^\s*Global[:]Lvl=(.*?)\w*$/) {
         ($breedlvl, $genlvl, $genleak, $gamephase) = split /,/, $1;
@@ -2523,15 +3663,108 @@ sub restoregame {
           $cashflow{sc}{$timeframe}{$category}{$subcat} = $number;
           $restored{cfsubcat}++;
         }
+      } elsif ($line =~ /^\s*Bond[:](.*?)\s*$/) {
+        my ($rest) = ($1);
+        #$rest =~ /(\w+),(\w+);(\d+);(\d+[-]\d+[-]\d+);(\d+[-]\d+[-]\d+);([0-9.]+)/;
+        my ($id, $issuer, $amt, $issuedate, $maturedate, $rate) = split /;/, $rest;
+        my %dt;
+        for my $x (["issued", $issuedate],
+                   ["mature", $maturedate]) {
+          my ($dtname, $string) = @$x;
+          if ($string =~ /(\d+)-(\d+)-(\d+)/) {
+            my ($y, $m, $d) = ($1, $2, $3);
+            eval { my $dt = DateTime->new( year      => $y,
+                                           month     => $m,
+                                           day       => $d,
+                                           hour      => 12,
+                                           time_zone => ($option{localtimezone} || "UTC"));
+                   $dt{$dtname} = $dt;
+                 };
+            die "DateTime error parsing $dtname date from save file line: $line" if not ref $dt{$dtname};
+          }}
+        push @bond, +{ id     => $id,
+                       issuer => $issuer,
+                       amount => $amt,
+                       issued => $dt{issued},
+                       mature => $dt{mature},
+                       rate   => $rate,
+                     };
+      } elsif ($line =~ /^\s*Stock[:](\w+)[=](.*?)\s*$/) {
+        my ($symbol, $rest) = ($1,$2);
+        my ($name, $industry, $sharecounts, $price, $sales, $assets, $cash, $debt, $index, $movement) = split /;/, $rest;
+        die "Error parsing save-file line: $line" if not defined $debt;
+        my ($owned, $totalshares) = split m(/), $sharecounts;
+        $stock{$symbol} = +{ symbol   => $symbol,
+                             name     => $name,
+                             industry => $industry,
+                             owned    => $owned,
+                             shares   => $totalshares,
+                             price    => $price,
+                             sales    => $sales,
+                             assets   => $assets,
+                             cash     => $cash,
+                             debt     => $debt,
+                             idx      => $index,
+                             movement => $movement,
+                           };
       } elsif ($line =~ /^\s*Option[:]([^=]+)=(.*?)\s*$/) {
         my ($name, $value) = ($1, $2);
         $option{$name} = $value if defined $value;
         $restored{option}++;
+      } elsif ($line =~ /^\s*Place[:](.*?)\s*$/) {
+        my ($t, $n, $p) = split /;\s*/, $1;
+        $p ||= undef; # Currently, worlds have no defined parent.
+        push @extantplace, +{ type => $t, name => $n, parent => $p, };
+      } elsif ($line =~ /^\s*County[:](.*?)\s*$/) {
+        my ($name, $cap, $cword, $licensed, $size, $owned, $avail, $lcost, $parent) = split /;\s*/, $1;
+        push @county, +{ name           => $name,
+                         capital        => $cap,
+                         capitalword    => $cword,
+                         licensed       => $licensed,
+                         size           => $size,
+                         owned_land     => $owned,
+                         available_land => $avail,
+                         landcost       => $lcost,
+                         parent         => $parent,
+                       };
+      } elsif ($line =~ /^\s*Province[:](.*?)\s*$/) {
+        my ($name, $cap, $cword, $licensed, $size, $counties, $suffix, $parent) = split /;\s*/, $1;
+        push @province, +{ name           => $name,
+                           capital        => $cap,
+                           capitalword    => $cword,
+                           licensed       => $licensed,
+                           size           => $size,
+                           counties       => $counties,
+                           countysuff     => $suffix,
+                           parent         => $parent,
+                         };
+      } elsif ($line =~ /^\s*Nation[:](.*?)\s*$/) {
+        my ($name, $cap, $cword, $licensed, $size, $provinces, $suffix, $parent) = split /;\s*/, $1;
+        push @nation, +{ name           => $name,
+                         capital        => $cap,
+                         capitalword    => $cword,
+                         licensed       => $licensed,
+                         size           => $size,
+                         provinces      => $provinces,
+                         provincesuff   => $suffix,
+                         parent         => $parent,
+                       };
+      } elsif ($line =~ /^\s*World[:](.*?)\s*$/) {
+        my ($name, $cap, $cword, $licensed, $size, $nations, $parent) = split /;\s*/, $1;
+        push @world, +{ name           => $name,
+                        capital        => $cap,
+                        capitalword    => $cword,
+                        licensed       => $licensed,
+                        size           => $size,
+                        provinces      => $nations,
+                        parent         => $parent,
+                      };
+        # TODO: larger jurisdictions
       } elsif ($line = /^\s*Message[:]([^:]+)[:](.*)/) {
         my ($channel, $text) = ($1, $2);
         push @message, [$text, $channel];
         $restored{message}++;
-      } elsif ($line =~ /^#/) {
+      } elsif ($line =~ /^\s*#/) {
         # Comment line, ignore it.
       } elsif ($line =~ /^\s*$/) {
         # Nothing but whitespace, ignore it.
@@ -2543,6 +3776,8 @@ sub restoregame {
     #$windowitem{budget}   = [budget_items()] if $restored{budget};
     %windowitem = init_windowitems();
     push @message, ["Restored.", "meta"];
+    #my @sym = keys %stock;
+    #push @message, ["Stocks: " . scalar @sym];
     close SAV;
     debuglog("Restored ($_): $restored{$_}") for sort { $a cmp $b } keys %restored;
   } else {
@@ -2564,6 +3799,7 @@ sub savegame {
     print SAV "Global:" . $name . "=" . sprintf("%04d", $dt->year()) . "-" . sprintf("%02d", $dt->month()) . "-" . sprintf("%02d", $dt->mday()) . "\n";
   }
   print SAV qq[Global:Cash=] . $cash . " zorkmids\n";
+  print SAV qq[Global:Primerate=] . $primerate . "%\n";
   print SAV qq[Global:Lvl=] . (join ",", map { 0 + $_ } ($breedlvl, $genlvl, $genleak, $gamephase)) . "\n";
   print SAV qq[#### Assets\n];
   for my $atype (sort { ($asset{$a}{sort} || $asset{$a}{value}) <=> ($asset{$b}{sort} || $asset{$b}{value}) } keys %asset) {
@@ -2595,6 +3831,46 @@ sub savegame {
   for my $o (grep { $$_{save} =~ /game/ } @option) {
     print SAV qq[Option:$$o{name}=$option{$$o{name}}\n];
   }
+  print SAV qq[#### Investment Section\n];
+  for my $k (keys %stock) {
+    my $s = $stock{$k};
+    print SAV qq[Stock:$k=$$s{name};$$s{industry};$$s{owned}/$$s{shares};$$s{price};$$s{sales};$$s{assets};$$s{cash};$$s{debt};$$s{idx};$$s{movement}\n];
+  }
+  for my $b (grep { $$_{mature} ge $date->ymd() } @bond) {
+    my $idate = $$b{issued}->ymd();
+    my $mdate = $$b{mature}->ymd();
+    print SAV qq[Bond:$$b{id};$$b{issuer};$$b{amount};$idate;$mdate;$$b{rate}\n];
+  }
+  print SAV qq[#### Places Section\n];
+  for my $p (@extantplace) {
+    my $parent = $$p{parent} || "";
+    print SAV qq[Place:$$p{type};$$p{name};$parent\n];
+  }
+  for my $c (@county) {
+    print SAV qq[County:] . (join ";", map { $$c{$_}
+                                           } qw(name capital capitalword licensed
+                                                size owned_land available_land landcost parent))
+      . "\n";
+  }
+  for my $p (@province) {
+    print SAV qq[Province:] . (join ";", map { $$p{$_}
+                                           } qw(name capital capitalword licensed
+                                                size counties countysuff parent))
+      . "\n";
+  }
+  for my $n (@nation) {
+    print SAV qq[Nation:] . (join ";", map { $$n{$_}
+                                           } qw(name capital capitalword licensed
+                                                size provinces provincesuff parent))
+      . "\n";
+  }
+  for my $w (@world) {
+    print SAV qq[World:] . (join ";", map { $$w{$_}
+                                          } qw(name capital capitalword licensed
+                                               size nations parent))
+      . "\n";
+  }
+  # TODO: larger jurisdictions
   print SAV qq[#### Messages Section\n];
   for my $m (@message) {
     my ($text, $channel) = @$m;
@@ -2686,42 +3962,6 @@ sub layout {
               id      => $wcount++,
               preseed => 7,
               redraw  => 1, };
-  #if ($ymax > 26) {
-  #  $wrealclock = +{ type => "clock",
-  #                   x => 0, y => $ymax - 5,
-  #                   fg        => "green",
-  #                   title     => "RealTime",
-  #                   showdate  => 1,
-  #                   showdow   => 1,
-  #                   showam    => 1,
-  #                   minutefg  => "spring green",
-  #                   colonfg   => "blue",
-  #                   dowfg     => "green",
-  #                   borderfg  => "green",
-  #                   redraw    => 1,
-  #                   skipfocus => 1,
-  #                   id        => $wcount++,
-  #                 };
-  #  $wgameclock = +{ type      => "clock",
-  #                   faketime  => $date,
-  #                   skipfocus => 1,
-  #                   x => 12, y => $ymax - 5,
-  #                   fg        => "cyan",
-  #                   title     => "GameTime",
-  #                   showdate  => 1,
-  #                   showdow   => 1,
-  #                   showam    => 1,
-  #                   minutefg  => "azure",
-  #                   colonfg   => "blue",
-  #                   dowfg     => "cyan",
-  #                   borderfg  => "teal",
-  #                   redraw    => 1,
-  #                   id        => $wcount++,
-  #                 };
-  #} else {
-  #  $wrealclock = undef;
-  #  $wgameclock = undef;
-  #}
   $wtopbar   = +{ type => "text", title => "Eggs Titlebar", redraw => 0,
                   text => join("", map { " " } 0 .. $xmax),
                   x => 0, y => 0, xmax => $xmax, ymax => 0,
@@ -2731,16 +3971,10 @@ sub layout {
                 };
   $wcashflow = +{ type => "egggame", subtype => "cashflow", title => "Cash Flow (F9)", mode => "",
                   redraw => 1, x => 0, y => 1, xmax => $leftsize - 1,
-                  ymax => $ymax,# - ($wgameclock ? 5 : 0),
+                  ymax => $ymax - 1,
                   fg => "gold", focusbg => 'brown', id => $wcount++, transparent => 1,
                   input => sub { input_cashflow(@_); },
-                  #helpinfo => sub {
-                  #  my ($w) = @_;
-                  #  return map {
-                  #    +{ text => $_, },
-                  #  } (format_help_info($w, qq[Press s, b, e, or p to view details about sales, budget expenses, essentials, or purchases, respectively.]),
-                  #     format_help_info($w, qq[Press o to return to the overview.]));
-                  #},
+                  onscroll => sub { eggwidget_onscroll(@_) },
                   helpinfo => [ qq[Press s, b, e, or p to view details about sales, budget expenses, essentials, or purchases, respectively.],
                                 qq[Press o to return to the overview.],
                               ],
@@ -2750,7 +3984,12 @@ sub layout {
                   messages => \@message, lines => \@messageline,
                   msgpos => 0, linepos => 0, xpos => 0,
                   fg => "spring green", focusbg => "grey", id => $wcount++,
+                  input => sub { input_messagelog(@_); },
+                  onscroll => sub { messagelog_onscroll(@_) },
                   transparent => 1,
+                  helpinfo => [ qq[Use arrow keys or PgUp, PgDn to scroll.],
+                                qq[Home or End to jump to the beginning or end.],
+                              ],
                 };
   $wassets = +{ type => "egggame", subtype => "assets", title => "Assets (F7)", redraw => 1,
                 x => $xmax - $rightsize - 1, xmax => $xmax, fg => "indigo", focusbg => "red",
@@ -2758,14 +3997,15 @@ sub layout {
               };
   $wbudget = +{ type => "egggame", subtype => "budget", title => "Budget (F6)", redraw => 1,
                 x => $xmax - $rightsize - 1, xmax => $xmax,
-                y => $ymax - $budgetheight, ymax => $ymax,
+                y => $ymax - $budgetheight, ymax => $ymax - 1,
                 fg => "purple-red", focusbg => "purple", id => $wcount++, transparent => 1,
                 input => sub { input_budget(@_); },
+                onscroll => sub { eggwidget_onscroll(@_) },
               };
   if ($option{debug}) {
     $wordkey = +{ type => "ordkey", title => "OrdKey F12", redraw => 1,
                   line1 => "Press Keys",
-                  x => $leftsize, y => $msgheight, xmax => $leftsize + 12, ymax => $ymax,
+                  x => $leftsize, y => $msgheight, xmax => $leftsize + 12, ymax => $ymax - 1,
                   input => sub { input_ordkey(@_); },
                   fg => "purple", #bg => "purple",
                   id => $wcount++,
@@ -2775,26 +4015,34 @@ sub layout {
   my $middlesize = $xmax - $leftsize - $rightsize - ($wordkey ? 12 : 0);
   my $buysize = int($middlesize * 3 / 5) - 1;
   $wbuy = +{ type => "egggame", subtype => "buy", title => "Buy (F3)", redraw => 1,
-             x => $leftsize + ($wordkey ? 12 : 0), y => $msgheight, ymax => $ymax,
+             x => $leftsize + ($wordkey ? 12 : 0), y => $msgheight, ymax => $ymax - 1,
              xmax => $leftsize + ($wordkey ? 12 : 0) + $buysize,
              input => sub { input_buy(@_); },
+             onscroll => sub { eggwidget_onscroll(@_) },
              fg => "teal", focusbg => "cyan", id => $wcount++,
              transparent => 1,
            };
   $wsettings = +{ type => "egggame", subtype => "settings", title => "Settings (F10)", redraw => 1,
-                  x => $leftsize + ($wordkey ? 12 : 0) + $buysize, y => $msgheight, ymax => $ymax,
+                  x => $leftsize + ($wordkey ? 12 : 0) + $buysize, y => $msgheight, ymax => $ymax - 1,
                   xmax => $xmax - $rightsize - 2,
                   input => sub { input_settings(@_); },
+                  onscroll => sub { eggwidget_onscroll(@_) },
                   fg => "cyan", focusbg => "green", id => $wcount++,
                   transparent => 1,
                 };
+  $wticker = +{ type => "ticker", title => "Stock Ticker", redraw => 0,
+                text => join("", map { " " } 0 .. $xmax),
+                x => 0, y => $ymax - 1, xmax => $xmax, ymax => $ymax -1,
+                bg => "blue", fg => "white", "pricefg" => "yellow",
+                id => $wcount++,
+              };
   $wfocus ||= $wbuy;
   $$wbg{disabled} = ($option{colordepth} >= 8) ? 0 : 1;
   @widget = grep { $_ and not $$_{disabled}
                  } ($wbg, $wtopbar, $wcashflow,
                     #$wgameclock, $wrealclock,
                     $wmessages, $wordkey, $wbuy, $wsettings,
-                    $wassets, $wbudget);
+                    $wassets, $wbudget, $wticker);
   for my $w (@widget) {
     $$w{contentsizex} ||= $$w{xmax} - $$w{x} - 2;
     $$w{contentsizey} ||= $$w{ymax} - $$w{y} - 2;
@@ -2829,7 +4077,7 @@ sub debuglog {
   my ($msg) = @_;
   if ($option{debug}) {
     #open DEBUG, ">>", "debug.log";
-    #my $now = DateTime->now( time_zone => $option{localtimezone} );
+    #my $now = DateTime->now( time_zone => ($option{localtimezone} || UTC) );
     #print DEBUG $msg . "\n";
     #close DEBUG;
     egggamelog($msg);
@@ -2878,7 +4126,11 @@ sub commalist {
 
 sub shownum {
   my ($n) = @_;
-  if ($n > 10 * 1000 * 1000 * 1000 * 1000 * 1000) {
+  my $sign = ($n >= 0) ? "" : "-";
+  $n = abs($n);
+  if ($n > 10 * 1000 * 1000 * 1000 * 1000 * 1000 * 1000) {
+    # Over 10 quintillion, not actually possible on a 64-bit system without a bignum library.
+    # At some point I will have to do something about that, probably use bignum;
     my $exp = 0;
     my $base = $n;
     while ($base > 1000) {
@@ -2889,39 +4141,54 @@ sub shownum {
       $exp++;
       $base = int($base + 4.999) / 10;
     }
-    return $base . "e+0" . $exp; # scientific notation
-  } elsif ($n > 100 * 1000 * 1000 * 1000 * 1000 * 1000) {
-    my $q = int(($n + 500 * 1000 * 1000 * 1000 * 1000) / (1000 * 1000 * 1000 * 1000 * 1000));
-    return $q . "q"; # quadrillion
+    return $sign . $base . "e+0" . $exp; # scientific notation
+  } elsif ($n > 100 * 1000 * 1000 * 1000 * 1000 * 1000 * 1000) {
+    my $q = int(($n + 500 * 1000 * 1000 * 1000 * 1000 * 1000) / (1000 * 1000 * 1000 * 1000 * 1000 * 1000));
+    return $sign . $q . "q"; # quadrillion
   } elsif ($n >  10 * 1000 * 1000 * 1000 * 1000 * 1000) {
     my $q = int(($n + 500 * 1000 * 1000 * 1000 * 1000) / (100 * 1000 * 1000 * 1000 * 1000)) / 10;
-    return $q . "q"; # quadrillion
+    return $sign . $q . "q"; # quadrillion
   } elsif ($n > 100 * 1000 * 1000 * 1000 * 1000) {
     my $t = int(($n + 500 * 1000 * 1000 * 1000) / (1000 * 1000 * 1000 * 1000));
-    return $t . "t"; # trillion
+    return $sign . $t . "t"; # trillion
   } elsif ($n >  10 * 1000 * 1000 * 1000 * 1000) {
     my $t = int(($n + 500 * 1000 * 1000 * 1000) / (100 * 1000 * 1000 * 1000)) / 10;
-    return $t . "t"; # trillion
+    return $sign . $t . "t"; # trillion
   } elsif ($n > 100 * 1000 * 1000 * 1000) {
     my $b = int(($n + 500 * 1000 * 1000) / (1000 * 1000 * 1000));
-    return $b . "b"; # billion
+    return $sign . $b . "b"; # billion
   } elsif ($n >  10 * 1000 * 1000 * 1000) {
     my $b = int(($n + 500 * 1000 * 1000) / (100 * 1000 * 1000)) / 10;
-    return $b . "b"; # billion
+    return $sign . $b . "b"; # billion
   } elsif ($n > 100 * 1000 * 1000) {
     my $m = int(($n + 500000) / (1000 * 1000));
-    return $m . "m"; # million
+    return $sign . $m . "m"; # million
   } elsif ($n >  10 * 1000 * 1000) {
     my $m = int(($n + 500000) / (100 * 1000)) / 10;
-    return $m . "m"; # million
+    return $sign . $m . "m"; # million
   } elsif ($n > 100 * 1000) {
     my $m = int(($n + 500) / 1000);
-    return $m . "k"; # k=thousand
+    return $sign . $m . "k"; # k=thousand
   } elsif ($n >  10 * 1000) {
     my $m = int(($n + 500) / 100) / 10;
-    return $m . "k"; # k=thousand
-  } else {
+    return $sign . $m . "k"; # k=thousand
+  } elsif ($n >= 1000) {
+    return $sign . int $n;
+  } elsif ($n >= 100) {
+    return $sign . (int($n * 10) / 10);
+  } elsif ($n >= 10) {
+    return $sign . (int($n * 100) / 100);
+  } elsif ($n >= 1) {
+    return $sign . (int($n * 1000) / 1000);
+  } elsif ($n == 0) {
     return $n;
+  } else { # scientific notation.
+    my $exp = 0;
+    while (abs($n) < 1) {
+      $exp++;
+      $n = $n * 10;
+    }
+    return $sign . ((int($n * 1000) / 1000) . "E-" . sprintf("%02d", $exp));
   }
 }
 
@@ -2934,6 +4201,12 @@ sub randomorder {
   } map {
     [$_ => rand(65535) ]
   } @item;
+}
+
+sub uniq {
+  my (@item) = @_;
+  my %seen;
+  return grep { not $seen{$_}++ } @item;
 }
 
 sub uptime {
@@ -2956,13 +4229,6 @@ sub diffuse_scale {
   } else {
     return int $sqr;
   }
-}
-
-sub notepad_unescape {
-  my ($text) = @_;
-  # TODO: improve on this.
-  $text =~ tr/_/ /;
-  return $text;
 }
 
 sub valuefromexpectations {

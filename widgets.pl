@@ -305,6 +305,7 @@ sub wrap_message_log {
     message_log_wrap_message($w, $msgidx);
     $$w{msgpos}++;
   }
+  $$w{vscrollhome} = $$w{contentsizey} - scalar @{$$w{lines}};
 }
 
 sub message_log_wrap_message {
@@ -347,6 +348,72 @@ sub message_log_wrap_message {
   }
 }
 
+sub scroll_widget_to {
+  # There are two major kinds of widget scrolling: forward/positive and backward/negative.
+  #  * Forward or positive scrolling is when the widget defaults to displaying the top or
+  #    beginning of the content but the user can scroll through to the end.  This can be
+  #    used e.g. for menus or help screens, among other things.  Forward scrolling sets
+  #    $$w{vscrollpos} to a positive number.  Setting it back to 0 returns it to the top.
+  #    Widgets with forward scrolling need to set $$w{vscrollend} based on the length
+  #    of the content, if a scroll-to-end feature is wanted.
+  #  * Backward or negative scrolling is when the widget defaults to displaying the
+  #    tail end or bottom of the content but the user can scroll back up to the top.
+  #    This is mainly useful for log-type content (message logs, error logs, etc.)
+  #    Backward scrolling sets $$w{vscrollpos} to a negative number; setting it to 0
+  #    returns the widget to the most recent data at the tail end of the log.  Widgets
+  #    with this type of scrolling should set $$w{vscrollhome} based on the length of
+  #    the content, if a scroll-to-top feature is wanted.
+  my ($w, $newpos) = @_;
+  if ("CODE" eq ref $newpos) {
+    $$w{vscrollpos} = $newpos->($w);
+  } else {
+    $$w{vscrollpos} = $newpos;
+  }
+  if (ref $$w{onscroll}) {
+    $$w{onscroll}->($w);
+  }
+}
+
+sub doscrollbar {
+  my ($w, $s, %more) = @_;
+  my $x = $$w{xmax} || ($$w{x} + $$w{contentsizex} + 1);
+  my $sliderpos = 0; # linecount is needed to set it; otherwise it defaults to no slider.
+  if (($$w{vscrollpos} < 0) and ($more{linecount})) {
+    $sliderpos = 1 + int ($$w{contentsizey} * (1 - ((0 - $$w{vscrollpos}) / $more{linecount})));
+  } elsif ($more{linecount}) {
+    $sliderpos = 1 + int ($$w{contentsizey} * ($$w{vscrollpos} / $more{linecount}));
+  }
+  my ($fg, $char);
+  for my $y (1 .. $$w{contentsizey}) {
+    if ($y == $sliderpos) {
+      $char = $$w{sliderchar} || $$w{sliderchar} || $option{sliderchar} || "◙";
+      $fg   = widgetfg($w, ["sliderfg", "scrollbarfg"]);
+    } elsif ($y < $sliderpos) {
+      $fg   = widgetfg($w, ["scrollbartopfg", "scrollbarfg"]);
+      $char = $$w{scrollbartopchar} || $option{scrollbartopchar}
+        || $$w{scrollbarchar} || $option{scrollbarchar} || "░";
+    } else {
+      $fg   = widgetfg($w, "scrollbarfg");
+      $char = $$w{scrollbarchar} || $option{scrollbarchar} || "▒";
+    }
+    $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y} + $y] =
+      +{ char => $char,
+         fg => $fg,
+         bg => widgetbg($w, "borderbg", $$s[$$w{x} + $$w{contentsizex} + 1][$$w{y} + $y])
+       };
+  }
+}
+
+sub messagelog_onscroll {
+  my ($w) = @_;
+  return if not ref $$w{lines};
+  if ($$w{vscrollpos} > ((1 + scalar @{$$w{lines}}) - $$w{contentsizey})) {
+    $$w{vscrollpos} = (1 + scalar @{$$w{lines}}) - $$w{contentsizey};
+  } elsif ($$w{vscrollpos} < ($$w{contentsizey} - scalar @{$$w{lines}})) {
+    $$w{vscrollpos} = ($$w{contentsizey} - scalar @{$$w{lines}});
+  }
+}
+
 sub domessagelog {
   my ($w, $s, %more) = @_;
   if ($$w{redraw}) {
@@ -356,7 +423,12 @@ sub domessagelog {
   my $width = $$w{xmax} - $$w{x} - 2;
   my $height = $$w{ymax} - $$w{y} - 2;
   my @line = @{$$w{lines}};
-  # TODO: scrollpos
+  if ($$w{vscrollpos} < 0) {
+    doscrollbar($w, $s, , %more, linecount => scalar @{$$w{lines} || +[]});
+    for ($$w{vscrollpos} .. -1) {
+      pop @line;
+    }
+  }
   while ($height < scalar @line) {
     shift @line;
   }
@@ -402,6 +474,13 @@ sub format_help_info {
   return @line;
 }
 
+sub notepad_unescape {
+  my ($text) = @_;
+  # TODO: improve on this.
+  $text =~ tr/_/ /;
+  return $text;
+}
+
 sub donotepad {
   my ($w, $s, %more) = @_;
   if ((not $$w{xmax}) or (not $$w{ymax})) {
@@ -421,7 +500,7 @@ sub donotepad {
   $$w{contentsizex} ||= $$w{xmax} - $$w{x} - 2;
   $$w{contentsizey} ||= $$w{ymax} - $$w{y} - 2;
   doborder($w, $s, %more);
-  for my $n (1 .. ($$w{ymax} - $$w{y} - 2)) {
+  for my $n ((1 + ($$w{vscrollpos} || 0)) .. (($$w{vscrollpos} || 0) + ($$w{ymax} - $$w{y} - 2))) {
     my $id = $$w{id} . "_line" . $n;
     dotext(+{ id          => $id,
               text        => substr((($$w{"line" . $n} || "") .
@@ -439,7 +518,10 @@ sub input_ordkey {
   my ($w, $k) = @_;
   my $n = 1;
   while ($$w{"line" . $n}) { $n++; }
-  $$w{"line" . $n} = ord $k;
+  for my $char (split //, $k) {
+    $$w{"line" . $n} = ord $char;
+    $n++;
+  }
   # If we hit the bottom of the available space, scroll:
   while ($n + 2 > ($$w{ymax} - $$w{y})) {
     for my $p (1 .. $n) {
@@ -447,7 +529,6 @@ sub input_ordkey {
     }
     $n--;
   }
-  #draweggscreen($screen, %option);
 }
 
 sub doordkey {
@@ -759,28 +840,34 @@ sub diffuse_scale {
   }
 }
 
+sub choosecolorfield {
+  my ($w, $fields, $focus) = @_;
+  if ($focus) {
+    return $focus if $option{$focus};
+    return $focus if $$w{$focus};
+  }
+  return $fields if not ref $fields;
+  for my $f (@$fields) {
+    return $f if $option{$f};
+    return $f if $$w{$f};
+  }
+  return;
+}
+
 sub widgetfg {
-  my ($w, $fgfield) = @_;
-  #croak(Dumper(+{ option => \%option })) if not $option{colordepth};
+  my ($w, $fields) = @_;
   return "default" if $option{colordepth} < 3;
-  $fgfield ||= "fg"; $fgfield = "fg" if not $$w{$fgfield};
+  my $fgfield = choosecolorfield($w, $fields) || "fg";
   colorlog("widgetfg($$w{id}, '$fgfield'): "
            . (("ARRAY" eq ref $$w{$fgfield}) ? "<" . @{$$w{$fgfield}} . ">" : $$w{$fgfield}));
-  # Debugging only.  Comment out for backward-compatibility with old monitor.cfg files:
-  ## my $depth = $option{colordepth} || 8;
-  ## croak "widgetfg: color depth $depth not supported.  " . Dumper(+{ w => $w, fgfield => $fgfield })
-  ##   if ((ref $$w{$fgfield}) and not (("HASH" eq ref $$w{$fgfield}) and $$w{$fgfield}{$depth}));
-  return $$w{$fgfield} || $option{fg} || "white";
+  return $$w{$fgfield} || $option{$fgfield} || $$w{fg} || $option{fg} || "white";
 }
 
 sub widgetbg {
-  my ($w, $bgfield, $old) = @_;
-  #croak "widgetbg(): no third argument" if not defined $old;
-  #croak(Dumper(+{ option => \%option })) if not $option{colordepth};
+  my ($w, $fields, $old) = @_;
   $old ||= +{ char => "E", fg => 'yellow', bg => 'red' };
   return "default" if $option{colordepth} < 3;
-  $bgfield ||= ($$w{id} eq $$wfocus{id}) ? "focusbg" : "bg";
-  $bgfield = "bg" if not $$w{$bgfield};
+  my $bgfield = choosecolorfield($w, $fields, (($$w{id} eq $$wfocus{id}) ? "focusbg" : undef)) || "bg";
   if ($$w{transparent}
       and ($$w{id} ne ((ref $wfocus) ? ($$wfocus{id} || "__DO_NOT_MATCH__") : "__NO_MATCH__"))) {
     #croak "widgetbg(): improper old cell: $old  " . Dumper(+{ screen => $screen }) . "\nrepeat, widgetbg(): improper old cell: $old  "
@@ -803,7 +890,7 @@ sub widgetbg {
   ##my $depth = $option{colordepth} || 8;
   ##croak "widgetbg: color depth $depth not supported.  " . Dumper(+{ w => $w, bgfield => $bgfield })
   ##  if ((ref $$w{$bgfield}) and not (("HASH" eq ref $$w{$bgfield}) and $$w{$bgfield}{$depth}));
-  return $$w{$bgfield}  || $$w{bg} || $option{bg} || "black";
+  return $$w{$bgfield} || $option{$bgfield} || $$w{bg} || $option{bg} || "black";
 }
 
 sub drawscreen {
