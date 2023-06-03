@@ -4,9 +4,19 @@
 use Carp;
 use File::Spec::Functions;
 
+# Directory where the log files reside:
 our $logdir         = "/var/log";
+
+# Log files used by widgets.pl:
 our $widgetlogfile  = catfile($logdir, "perl-term-widgets.log");
+our $screenlogfile  = catfile($logdir, "perl-term-widgets-drawscreen.log");
+our $colorlogfile   = catfile($logdir, "perl-term-widget-colors.log");
+
+# Log files used by server-monitor:
 our $verboselogfile = catfile($logdir, "perl-verbose.log");
 our $monitorlogfile = catfile($logdir, "server-monitor.log");
+
+# Log file used by the Eggs idle game:
+our $egggamelogfile = catfile($logdir, "egg-game.log");
 
 42;
