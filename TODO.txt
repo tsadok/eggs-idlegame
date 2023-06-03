@@ -5,24 +5,23 @@ TODO list for the eggs game:
 
  * Screen refresh loses track of cashflow mode, current focused widget
 
- * It's too hard to keep making breeding and genetic progress after ngp(),
-   especially when selling chickens only for meat.
+ * It may still be too hard to keep making breeding and genetic
+   progress after the first ngp(), especially when selling chickens
+   only for meat.  This needs play testing with a fresh account/game.
 
- * Allow scrolling frame content when it doesn't all fit (e.g., in the Messages frame).
+ * When frame content doesn't all fit (e.g., in the Messages frame),
+   draw the scrollbar even when in the home position, to signal that
+   scrolling is possible.
  
  * Playtest / balance genetic engineering.
 
- * Test the per-user config file options saving.
-
- * Add loss conditions, e.g., if you have no chicks or laying hens and can't afford to buy any.
-
  * The budget window should get re-initted when budget items unlock.
 
- * Budget items should either stay unlocked after ngp(), or reset to default values, perhaps both.
+ * Budget items should either stay unlocked after ngp(), or reset to
+   default values, perhaps both.  Genetic engineering, notably, gets
+   locked but retains its old value, which is wrong.
 
 Maybe Fixed (TEST):
 
  * Changing the window size and then refreshing, messes up the Messages window.
-
- * Add an option to automatically pause immediately after NGP.
 
